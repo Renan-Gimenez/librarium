@@ -1,0 +1,18 @@
+services:
+  librarium-pg:
+    container_name: librarium-pg
+    image: bitnami/postgresql
+    restart: always
+    environment:
+      - POSTGRESQL_USERNAME=dev
+      - POSTGRESQL_PASSWORD=dev
+      - POSTGRESQL_DATABASE=librarium
+      - POSTGRESQL_POSTGRES_PASSWORD=dev
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/bitnami/postgresql
+
+volumes:
+  pgdata:
+    driver: local
