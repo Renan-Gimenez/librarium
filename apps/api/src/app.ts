@@ -4,30 +4,12 @@ import {
   serializerCompiler,
   type ZodTypeProvider,
 } from "fastify-type-provider-zod";
-import { z } from "zod";
+
+import { booksRoutes } from "./routes";
 
 export const app = fastify().withTypeProvider<ZodTypeProvider>();
 
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
 
-app.get("/health", async () => {
-  return { ok: true };
-});
-
-app.post(
-  "/",
-  {
-    schema: {
-      body: z.object({
-        message: z.string().min(5),
-      }),
-    },
-  },
-  (req, res) => {
-    const { message } = req.body;
-    res.send({
-      message: message,
-    });
-  },
-);
+app.register(booksRoutes, { prefix: "/books" });
