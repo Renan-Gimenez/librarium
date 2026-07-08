@@ -2,6 +2,8 @@ import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 
 import { prisma } from "../../lib/prisma";
+import { PrismaBooksRepository } from "../../modules/book/repositories/prisma/prisma-books.repository";
+import { ListBooksUseCase } from "../../modules/book/use-cases/list-books.use-case";
 
 export const BookSchema = z.object({
   id: z.string(),
@@ -15,6 +17,8 @@ export const BookSchema = z.object({
   createdAt: z.date(),
   updatedAt: z.date(),
 });
+
+export type Book = z.infer<typeof BookSchema>;
 
 export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
   app.get(
@@ -30,7 +34,9 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
       },
     },
     async (req, res) => {
-      const books = await prisma.book.findMany();
+      const booksRepository = new PrismaBooksRepository();
+      const listBooksUseCase = new ListBooksUseCase(booksRepository);
+      const books = await listBooksUseCase.execute();
 
       return { data: books };
     },
