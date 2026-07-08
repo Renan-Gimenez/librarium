@@ -15,7 +15,25 @@ export interface SearchBooksQueryDTO {
 export class ListBooksUseCase {
   constructor(private booksRepository: IBooksRepository) {}
 
-  async execute(): Promise<Book[]> {
-    return this.booksRepository.findMany();
+  async execute({
+    id,
+    title,
+    author,
+    description,
+    coverUrl,
+    genreId,
+    rating,
+    publishedAt,
+  }: SearchBooksQueryDTO = {}): Promise<Book[]> {
+    return this.booksRepository.findMany({
+      id,
+      title,
+      author,
+      description,
+      coverUrl,
+      genreId,
+      rating,
+      publishedAt,
+    });
   }
 }

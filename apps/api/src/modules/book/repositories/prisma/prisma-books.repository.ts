@@ -1,9 +1,32 @@
+import { Prisma } from "../../../../generated/prisma/client";
 import { prisma } from "../../../../lib/prisma";
 import type { Book } from "../../../../routes/book/book.routes";
 import type { IBooksRepository } from "../books-repository.interface";
 
 export class PrismaBooksRepository implements IBooksRepository {
-  async findMany(): Promise<Book[]> {
-    return prisma.book.findMany();
+  async findMany(filters: {
+    id?: string;
+    title?: string;
+    author?: string;
+    description?: string;
+    coverUrl?: string;
+    genreId?: string;
+    rating?: number;
+    publishedAt?: Date;
+  } = {}): Promise<Book[]> {
+    const { id, title, author, description, coverUrl, genreId, rating, publishedAt } = filters;
+
+    const where: Prisma.BookWhereInput = {
+      id,
+      title: title ? { contains: title, mode: "insensitive" } : undefined,
+      author: author ? { contains: author, mode: "insensitive" } : undefined,
+      description: description ? { contains: description, mode: "insensitive" } : undefined,
+      coverUrl: coverUrl ? { contains: coverUrl, mode: "insensitive" } : undefined,
+      genreId,
+      rating,
+      publishedAt,
+    };
+
+    return prisma.book.findMany({ where });
   }
 }

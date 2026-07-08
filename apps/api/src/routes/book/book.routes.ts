@@ -26,6 +26,16 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
     {
       schema: {
         tags: ["Books"],
+        querystring: z.object({
+          id: z.uuid().optional(),
+          title: z.string().optional(),
+          author: z.string().optional(),
+          description: z.string().optional(),
+          coverUrl: z.string().optional(),
+          genreId: z.uuid().optional(),
+          rating: z.coerce.number().min(0).max(5).optional(),
+          publishedAt: z.coerce.date().optional(),
+        }),
         response: {
           200: z.object({
             data: z.array(BookSchema),
@@ -36,7 +46,7 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
     async (req, res) => {
       const booksRepository = new PrismaBooksRepository();
       const listBooksUseCase = new ListBooksUseCase(booksRepository);
-      const books = await listBooksUseCase.execute();
+      const books = await listBooksUseCase.execute(req.query);
 
       return { data: books };
     },
