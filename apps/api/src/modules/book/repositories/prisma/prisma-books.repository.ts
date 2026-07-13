@@ -1,7 +1,7 @@
 import { Prisma } from "../../../../generated/prisma/client";
 import { prisma } from "../../../../lib/prisma";
-import type { Book } from "../../../../routes/book/book.routes";
-import type { IBooksRepository } from "../books-repository.interface";
+import type { Book } from "../../entities/book.entity";
+import type { IBooksRepository, CreateBookInput } from "../books-repository.interface";
 
 export class PrismaBooksRepository implements IBooksRepository {
   async findMany(filters: {
@@ -28,5 +28,17 @@ export class PrismaBooksRepository implements IBooksRepository {
     };
 
     return prisma.book.findMany({ where });
+  }
+
+  async findById(id: string): Promise<Book | null> {
+    return prisma.book.findUnique({
+      where: { id },
+    });
+  }
+
+  async create(data: CreateBookInput): Promise<Book> {
+    return prisma.book.create({
+      data,
+    });
   }
 }

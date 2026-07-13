@@ -1,4 +1,4 @@
-import type { Book } from "../../../routes/book/book.routes";
+import type { Book } from "../entities/book.entity";
 import type { IBooksRepository } from "../repositories/books-repository.interface";
 
 export interface SearchBooksQueryDTO {

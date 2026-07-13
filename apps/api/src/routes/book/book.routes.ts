@@ -1,12 +1,13 @@
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 
-import { prisma } from "../../lib/prisma";
 import { PrismaBooksRepository } from "../../modules/book/repositories/prisma/prisma-books.repository";
+import { CreateBookUseCase } from "../../modules/book/use-cases/create-book.use-case";
+import { GetBookByIdUseCase } from "../../modules/book/use-cases/get-book-by-id.use-case";
 import { ListBooksUseCase } from "../../modules/book/use-cases/list-books.use-case";
 
 export const BookSchema = z.object({
-  id: z.string(),
+  id: z.uuid(),
   title: z.string(),
   author: z.string(),
   description: z.string().nullable(),
@@ -17,8 +18,6 @@ export const BookSchema = z.object({
   createdAt: z.date(),
   updatedAt: z.date(),
 });
-
-export type Book = z.infer<typeof BookSchema>;
 
 export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
   app.get(
@@ -73,11 +72,9 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
     async (req, res) => {
       const { id } = req.params;
 
-      const book = await prisma.book.findUnique({
-        where: {
-          id,
-        },
-      });
+      const booksRepository = new PrismaBooksRepository();
+      const getBookByIdUseCase = new GetBookByIdUseCase(booksRepository);
+      const book = await getBookByIdUseCase.execute(id);
 
       if (!book) {
         res.status(404);
@@ -110,27 +107,9 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
       },
     },
     async (req, res) => {
-      const {
-        title,
-        author,
-        description,
-        coverUrl,
-        genreId,
-        rating,
-        publishedAt,
-      } = req.body;
-
-      const book = await prisma.book.create({
-        data: {
-          title,
-          author,
-          description,
-          coverUrl,
-          genreId,
-          rating,
-          publishedAt,
-        },
-      });
+      const booksRepository = new PrismaBooksRepository();
+      const createBookUseCase = new CreateBookUseCase(booksRepository);
+      const book = await createBookUseCase.execute(req.body);
 
       res.status(201);
       return { data: book };
