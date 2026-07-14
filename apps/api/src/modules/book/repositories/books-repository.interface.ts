@@ -10,6 +10,8 @@ export interface CreateBookInput {
   publishedAt?: Date | null;
 }
 
+export type UpdateBookInput = Partial<CreateBookInput>;
+
 export interface IBooksRepository {
   findMany(filters?: {
     id?: string;
@@ -23,4 +25,6 @@ export interface IBooksRepository {
   }): Promise<Book[]>;
   findById(id: string): Promise<Book | null>;
   create(data: CreateBookInput): Promise<Book>;
+  update(id: string, data: UpdateBookInput): Promise<Book>;
+  delete(id: string): Promise<void>;
 }

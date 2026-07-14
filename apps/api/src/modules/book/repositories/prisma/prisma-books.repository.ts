@@ -1,7 +1,7 @@
 import { Prisma } from "../../../../generated/prisma/client";
 import { prisma } from "../../../../lib/prisma";
 import type { Book } from "../../entities/book.entity";
-import type { IBooksRepository, CreateBookInput } from "../books-repository.interface";
+import type { IBooksRepository, CreateBookInput, UpdateBookInput } from "../books-repository.interface";
 
 export class PrismaBooksRepository implements IBooksRepository {
   async findMany(filters: {
@@ -39,6 +39,19 @@ export class PrismaBooksRepository implements IBooksRepository {
   async create(data: CreateBookInput): Promise<Book> {
     return prisma.book.create({
       data,
+    });
+  }
+
+  async update(id: string, data: UpdateBookInput): Promise<Book> {
+    return prisma.book.update({
+      where: { id },
+      data,
+    });
+  }
+
+  async delete(id: string): Promise<void> {
+    await prisma.book.delete({
+      where: { id },
     });
   }
 }
