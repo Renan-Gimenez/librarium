@@ -12,7 +12,20 @@ services:
       - '5432:5432'
     volumes:
       - pgdata:/bitnami/postgresql
+    
+  librarium-redis:
+    container_name: librarium-redis
+    image: bitnami/redis:latest
+    restart: always
+    environment:
+      - ALLOW_EMPTY_PASSWORD=yes
+    ports:
+      - '6379:6379'
+    volumes:
+      - redisdata:/bitnami/redis/data
 
 volumes:
   pgdata:
+    driver: local
+  redisdata:
     driver: local

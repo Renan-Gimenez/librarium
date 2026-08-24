@@ -5,6 +5,8 @@ const envSchema = z.object({
   HOST: z.string().default("0.0.0.0"),
   OPENAI_API_KEY: z.string().min(1),
   DATABASE_URL: z.url(),
+  REDIS_URL: z.url(),
+  CHAT_SESSION_TTL: z.coerce.number().default(3600),
   NODE_ENV: z
     .enum(["development", "production", "test"])
     .default("development"),
