@@ -2,11 +2,10 @@ import { z } from "zod";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
-import { openai } from "../../lib/openai";
-import { redis } from "../../lib/redis";
+import { openai, redis } from "@/lib";
 
 import { SYSTEM_PROMPT } from "./chat.prompts";
-import { env } from "../../../config/env";
+import { env } from "@/config/env";
 
 export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
   app.post(

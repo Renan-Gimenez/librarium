@@ -9,8 +9,8 @@ import {
 import fastifySwagger from "@fastify/swagger";
 import fastifyApiReference from "@scalar/fastify-api-reference";
 
-import { booksRoutes } from "./routes";
-import { chatRoutes } from "./routes/chat/chat.routes";
+import { booksRoutes } from "@/modules/book/book.routes";
+import { chatRoutes } from "@/modules/chat/chat.routes";
 
 export const app = fastify({
   routerOptions: {

@@ -1,7 +1,7 @@
-import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 
-import { prisma } from "../../lib/prisma";
+import { prisma } from "@/lib/prisma";
 
 export const BookSchema = z.object({
   id: z.string(),
