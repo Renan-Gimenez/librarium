@@ -1,8 +1,9 @@
 @baseURL = http://localhost:3333
+@token = b8b7b5d9-ee2e-4580-ab77-b3092a93a409
 
 POST {{baseURL}}/chat
 Content-Type: application/json
-x-session-id: 523e4567-e89b-12d3-a456-426614174004
+Authorization: Bearer {{token}}
 
 {
     "message": "Olá, estamos iniciando uma conversa. Meu nome é Renan, quem é você?"

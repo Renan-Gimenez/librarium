@@ -2,12 +2,15 @@ import { z } from "zod";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
+import { env } from "@/config/env";
 import { openai, redis } from "@/lib";
+import { authMiddleware } from "@/middlewares/auth.middleware";
 
 import { SYSTEM_PROMPT } from "./chat.prompts";
-import { env } from "@/config/env";
 
 export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
+  app.addHook("preHandler", authMiddleware);
+
   app.post(
     "/",
     {
@@ -15,9 +18,11 @@ export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
         tags: ["Chat"],
         description:
           "Endpoint responsible for receiving a user message and returning the LLM response, incorporating the chat message history stored in Redis.",
-        headers: z.object({
-          "x-session-id": z.uuid(),
-        }),
+        security: [
+          {
+            bearerAuth: [],
+          },
+        ],
         body: z.object({
           message: z.string().trim().min(1, "Message cannot be empty."),
         }),
@@ -39,10 +44,10 @@ export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
       },
     },
     async (req, res) => {
-      const sessionId = req.headers["x-session-id"];
+      const token = req.token;
       const { message } = req.body;
 
-      const redisKey = `chat:session:${sessionId}:messages`;
+      const redisKey = `chat:session:${token}:messages`;
 
       const cachedHistory = await redis.get(redisKey);
 
@@ -78,7 +83,7 @@ export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
         max_completion_tokens: 600,
         presence_penalty: 0.2,
         frequency_penalty: 0.3,
-        user: sessionId,
+        user: token!,
         messages,
       });
 
