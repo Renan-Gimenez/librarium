@@ -1,4 +1,5 @@
 import { openai, prisma } from "@/lib";
+import type { Prisma } from "@/generated/prisma/client";
 import { z } from "zod";
 
 export const bookInputSchema = z.object({
@@ -23,6 +24,22 @@ export const updateBookInputSchema = z.object({
 
 export type BookInput = z.infer<typeof bookInputSchema>;
 export type UpdateBookInput = z.infer<typeof updateBookInputSchema>;
+
+export const listBooksQuerySchema = z.object({
+  search: z.string().trim().optional(),
+  title: z.string().trim().optional(),
+  author: z.string().trim().optional(),
+  genre: z.string().trim().optional(),
+  minRating: z.coerce.number().min(0).max(5).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(50).default(10),
+  sortBy: z
+    .enum(["title", "author", "rating", "publishedAt", "createdAt"])
+    .default("createdAt"),
+  order: z.enum(["asc", "desc"]).default("desc"),
+});
+
+export type ListBooksQuery = z.infer<typeof listBooksQuerySchema>;
 
 const buildSearchableText = (book: {
   title: string;
@@ -72,6 +89,92 @@ export const saveBookEmbedding = async (
     SET "embedding" = ${vector}::vector
     WHERE "id" = ${bookId}
   `;
+};
+
+export const listBooks = async (query: ListBooksQuery) => {
+  const {
+    search,
+    title,
+    author,
+    genre,
+    minRating,
+    page,
+    limit,
+    sortBy,
+    order,
+  } = query;
+
+  const whereConditions: Prisma.BookWhereInput[] = [];
+
+  if (search) {
+    whereConditions.push({
+      OR: [
+        { title: { contains: search, mode: "insensitive" } },
+        { author: { contains: search, mode: "insensitive" } },
+        { description: { contains: search, mode: "insensitive" } },
+      ],
+    });
+  }
+
+  if (title) {
+    whereConditions.push({
+      title: { contains: title, mode: "insensitive" },
+    });
+  }
+
+  if (author) {
+    whereConditions.push({
+      author: { contains: author, mode: "insensitive" },
+    });
+  }
+
+  if (genre) {
+    whereConditions.push({
+      genres: {
+        some: {
+          slug: { equals: genre, mode: "insensitive" },
+        },
+      },
+    });
+  }
+
+  if (minRating !== undefined) {
+    whereConditions.push({
+      rating: { gte: minRating },
+    });
+  }
+
+  const where: Prisma.BookWhereInput =
+    whereConditions.length > 0 ? { AND: whereConditions } : {};
+
+  const skip = (page - 1) * limit;
+
+  const [books, total] = await Promise.all([
+    prisma.book.findMany({
+      where,
+      include: {
+        genres: true,
+      },
+      orderBy: {
+        [sortBy]: order,
+      },
+      skip,
+      take: limit,
+    }),
+    prisma.book.count({ where }),
+  ]);
+
+  const totalPages = Math.ceil(total / limit);
+
+  return {
+    books,
+    meta: {
+      total,
+      page,
+      limit,
+      totalPages,
+    },
+  };
 };
 
 export const createBook = async (input: BookInput) => {

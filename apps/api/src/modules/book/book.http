@@ -1,7 +1,25 @@
 @baseURL = http://localhost:3333/api
 
-### List all books
-GET {{baseURL}}/books
+### List all books (with pagination)
+GET {{baseURL}}/books?page=1&limit=10
+
+### List books with global search (searches title, author, and description)
+GET {{baseURL}}/books?search=Cthulhu
+
+### List books filtered by genre slug
+GET {{baseURL}}/books?genre=terror
+
+### List books filtered by author
+GET {{baseURL}}/books?author=Lovecraft
+
+### List books filtered by minimum rating
+GET {{baseURL}}/books?minRating=4.5
+
+### List books sorted by rating descending
+GET {{baseURL}}/books?sortBy=rating&order=desc
+
+### List books with combined filters, search, and pagination
+GET {{baseURL}}/books?search=conto&genre=terror&minRating=4.0&sortBy=rating&order=desc&page=1&limit=5
 
 ### Get book by ID
 # Replace with a valid book UUID
