@@ -3,6 +3,8 @@ import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 
 import { prisma } from "@/lib/prisma";
 
+import { createBook, reindexBooks } from "./book.service";
+
 export const BookSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -94,30 +96,37 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
       },
     },
     async (req, res) => {
-      const {
-        title,
-        author,
-        description,
-        coverUrl,
-        genreId,
-        rating,
-        publishedAt,
-      } = req.body;
-
-      const book = await prisma.book.create({
-        data: {
-          title,
-          author,
-          description,
-          coverUrl,
-          genreId,
-          rating,
-          publishedAt,
-        },
-      });
+      const book = await createBook(req.body);
 
       res.status(201);
       return { data: book };
+    },
+  );
+
+  app.post(
+    "/reindex",
+    {
+      schema: {
+        tags: ["Books"],
+        body: z.object({
+          mode: z.enum(["missing", "all"]).default("missing"),
+        }),
+        response: {
+          200: z.object({
+            data: z.object({
+              mode: z.enum(["missing", "all"]),
+              reindexed: z.number(),
+            }),
+          }),
+        },
+      },
+    },
+    async (req, res) => {
+      const { mode } = req.body;
+
+      const reindexed = await reindexBooks(mode);
+
+      return { data: { mode, reindexed } };
     },
   );
 };
