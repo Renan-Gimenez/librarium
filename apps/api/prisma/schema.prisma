@@ -20,12 +20,11 @@ model Book {
   author      String
   description String?
   coverUrl    String?
-  genreId     String
   rating      Float?
   publishedAt DateTime?
   embedding   Unsupported("vector(1536)")?
 
-  genre Genre @relation(fields: [genreId], references: [id])
+  genres Genre[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -34,7 +33,7 @@ model Book {
 }
 
 model Genre {
-  id        String   @id @default(uuid())
+  slug      String   @id
   name      String   @unique
   books     Book[]
   createdAt DateTime @default(now())
