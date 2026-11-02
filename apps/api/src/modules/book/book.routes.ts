@@ -2,8 +2,9 @@ import { z } from "zod";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 
 import { prisma } from "@/lib/prisma";
+import { GenreSchema } from "@/modules/genre/genre.routes";
 
-import { createBook, reindexBooks } from "./book.service";
+import { bookInputSchema, createBook, reindexBooks } from "./book.service";
 
 export const BookSchema = z.object({
   id: z.string(),
@@ -11,7 +12,7 @@ export const BookSchema = z.object({
   author: z.string(),
   description: z.string().nullable(),
   coverUrl: z.string().nullable(),
-  genreId: z.string(),
+  genres: z.array(GenreSchema),
   rating: z.number().nullable(),
   publishedAt: z.date().nullable(),
   createdAt: z.date(),
@@ -32,7 +33,11 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
       },
     },
     async (req, res) => {
-      const books = await prisma.book.findMany();
+      const books = await prisma.book.findMany({
+        include: {
+          genres: true,
+        },
+      });
 
       return { data: books };
     },
@@ -63,6 +68,9 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
         where: {
           id,
         },
+        include: {
+          genres: true,
+        },
       });
 
       if (!book) {
@@ -79,15 +87,7 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
     {
       schema: {
         tags: ["Books"],
-        body: z.object({
-          title: z.string(),
-          author: z.string(),
-          description: z.string().nullable(),
-          coverUrl: z.string().nullable(),
-          genreId: z.string(),
-          rating: z.number().nullable(),
-          publishedAt: z.coerce.date().nullable(),
-        }),
+        body: bookInputSchema,
         response: {
           201: z.object({
             data: BookSchema,
