@@ -4,7 +4,14 @@ import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { prisma } from "@/lib/prisma";
 import { GenreSchema } from "@/modules/genre/genre.routes";
 
-import { bookInputSchema, createBook, reindexBooks } from "./book.service";
+import {
+  bookInputSchema,
+  createBook,
+  deleteBook,
+  reindexBooks,
+  updateBook,
+  updateBookInputSchema,
+} from "./book.service";
 
 export const BookSchema = z.object({
   id: z.string(),
@@ -100,6 +107,71 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
 
       res.status(201);
       return { data: book };
+    },
+  );
+
+  app.put(
+    "/:id",
+    {
+      schema: {
+        tags: ["Books"],
+        params: z.object({
+          id: z.string(),
+        }),
+        body: updateBookInputSchema,
+        response: {
+          200: z.object({
+            data: BookSchema,
+          }),
+          404: z.object({
+            data: z.null(),
+          }),
+        },
+      },
+    },
+    async (req, res) => {
+      const { id } = req.params;
+
+      const book = await updateBook(id, req.body);
+
+      if (!book) {
+        res.status(404);
+        return { data: null };
+      }
+
+      return { data: book };
+    },
+  );
+
+  app.delete(
+    "/:id",
+    {
+      schema: {
+        tags: ["Books"],
+        params: z.object({
+          id: z.string(),
+        }),
+        response: {
+          200: z.object({
+            message: z.string(),
+          }),
+          404: z.object({
+            data: z.null(),
+          }),
+        },
+      },
+    },
+    async (req, res) => {
+      const { id } = req.params;
+
+      const deleted = await deleteBook(id);
+
+      if (!deleted) {
+        res.status(404);
+        return { data: null };
+      }
+
+      return { message: `Book "${id}" deleted successfully.` };
     },
   );
 
