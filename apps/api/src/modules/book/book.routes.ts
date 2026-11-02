@@ -8,10 +8,19 @@ import {
   bookInputSchema,
   createBook,
   deleteBook,
+  listBooks,
+  listBooksQuerySchema,
   reindexBooks,
   updateBook,
   updateBookInputSchema,
 } from "./book.service";
+
+export const PaginationMetaSchema = z.object({
+  total: z.number(),
+  page: z.number(),
+  limit: z.number(),
+  totalPages: z.number(),
+});
 
 export const BookSchema = z.object({
   id: z.string(),
@@ -32,21 +41,19 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
     {
       schema: {
         tags: ["Books"],
+        querystring: listBooksQuerySchema,
         response: {
           200: z.object({
             data: z.array(BookSchema),
+            meta: PaginationMetaSchema,
           }),
         },
       },
     },
     async (req, res) => {
-      const books = await prisma.book.findMany({
-        include: {
-          genres: true,
-        },
-      });
+      const { books, meta } = await listBooks(req.query);
 
-      return { data: books };
+      return { data: books, meta };
     },
   );
 
