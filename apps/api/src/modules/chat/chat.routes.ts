@@ -15,6 +15,12 @@ export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
   app.post(
     "/",
     {
+      config: {
+        rateLimit: {
+          max: env.RATE_LIMIT_CHAT_MAX,
+          timeWindow: "1 minute",
+        },
+      },
       schema: {
         tags: ["Chat"],
         description:
