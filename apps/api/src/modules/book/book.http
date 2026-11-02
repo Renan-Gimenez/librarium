@@ -1,0 +1,42 @@
+@baseURL = http://localhost:3333/api
+
+### List all books
+GET {{baseURL}}/books
+
+### Get book by ID
+# Replace with a valid book UUID
+@bookId = 328006b5-7073-4556-9b57-61f22495b2ce
+GET {{baseURL}}/books/{{bookId}}
+
+### Create a new book
+POST {{baseURL}}/books
+Content-Type: application/json
+
+{
+  "title": "O Chamado de Cthulhu",
+  "author": "H. P. Lovecraft",
+  "description": "Conto de horror cósmico clássico.",
+  "genreSlugs": ["terror"],
+  "rating": 4.8
+}
+
+### Update book by ID
+PUT {{baseURL}}/books/{{bookId}}
+Content-Type: application/json
+
+{
+  "title": "O Chamado de Cthulhu - Edição Especial",
+  "rating": 5.0
+}
+
+### Delete book by ID
+DELETE {{baseURL}}/books/{{bookId}}
+
+### Reindex embeddings (mode: missing)
+POST {{baseURL}}/books/reindex
+Content-Type: application/json
+
+{
+  "mode": "missing"
+}
+

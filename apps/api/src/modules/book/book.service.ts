@@ -11,7 +11,18 @@ export const bookInputSchema = z.object({
   publishedAt: z.coerce.date().nullable().optional(),
 });
 
+export const updateBookInputSchema = z.object({
+  title: z.string().min(1).optional(),
+  author: z.string().min(1).optional(),
+  description: z.string().nullable().optional(),
+  coverUrl: z.string().nullable().optional(),
+  genreSlugs: z.array(z.string()).optional(),
+  rating: z.number().nullable().optional(),
+  publishedAt: z.coerce.date().nullable().optional(),
+});
+
 export type BookInput = z.infer<typeof bookInputSchema>;
+export type UpdateBookInput = z.infer<typeof updateBookInputSchema>;
 
 const buildSearchableText = (book: {
   title: string;
@@ -112,6 +123,91 @@ export const createBook = async (input: BookInput) => {
   await saveBookEmbedding(book.id, embedding);
 
   return book;
+};
+
+export const updateBook = async (id: string, input: UpdateBookInput) => {
+  const existingBook = await prisma.book.findUnique({
+    where: { id },
+    include: { genres: true },
+  });
+
+  if (!existingBook) {
+    return null;
+  }
+
+  const { genreSlugs, ...data } = input;
+
+  let genresToConnect = existingBook.genres;
+  if (genreSlugs !== undefined) {
+    if (genreSlugs.length > 0) {
+      const existingGenres = await prisma.genre.findMany({
+        where: { slug: { in: genreSlugs } },
+      });
+
+      if (existingGenres.length !== genreSlugs.length) {
+        const foundSlugs = new Set(existingGenres.map((g) => g.slug));
+        const missing = genreSlugs.filter((s) => !foundSlugs.has(s));
+        throw new Error(`Genre(s) not found: ${missing.join(", ")}`);
+      }
+      genresToConnect = existingGenres;
+    } else {
+      genresToConnect = [];
+    }
+  }
+
+  const newTitle = data.title ?? existingBook.title;
+  const newAuthor = data.author ?? existingBook.author;
+  const newDescription =
+    data.description !== undefined ? data.description : existingBook.description;
+
+  const searchableText = buildSearchableText({
+    title: newTitle,
+    author: newAuthor,
+    description: newDescription,
+    genres: genresToConnect,
+  });
+
+  const embedding = await generateEmbedding(searchableText);
+
+  const updatedBook = await prisma.book.update({
+    where: { id },
+    data: {
+      ...(data.title !== undefined && { title: data.title }),
+      ...(data.author !== undefined && { author: data.author }),
+      ...(data.description !== undefined && { description: data.description }),
+      ...(data.coverUrl !== undefined && { coverUrl: data.coverUrl }),
+      ...(data.rating !== undefined && { rating: data.rating }),
+      ...(data.publishedAt !== undefined && { publishedAt: data.publishedAt }),
+      ...(genreSlugs !== undefined && {
+        genres: {
+          set: genreSlugs.map((slug) => ({ slug })),
+        },
+      }),
+    },
+    include: {
+      genres: true,
+    },
+  });
+
+  await saveBookEmbedding(id, embedding);
+
+  return updatedBook;
+};
+
+export const deleteBook = async (id: string) => {
+  const existingBook = await prisma.book.findUnique({
+    where: { id },
+  });
+
+  if (!existingBook) {
+    return false;
+  }
+
+  await prisma.book.delete({
+    where: { id },
+  });
+
+  return true;
 };
 
 export const reindexBooks = async (mode: "missing" | "all" = "missing") => {
