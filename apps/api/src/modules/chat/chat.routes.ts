@@ -7,6 +7,7 @@ import { openai, redis } from "@/lib";
 import { authMiddleware } from "@/middlewares/auth.middleware";
 
 import { SYSTEM_PROMPT } from "./chat.prompts";
+import { searchSimilarBooks } from "../book/book.service";
 
 export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
   app.addHook("preHandler", authMiddleware);
@@ -62,10 +63,22 @@ export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
         ? JSON.parse(cachedHistory)
         : [];
 
+      const relevantBooks = await searchSimilarBooks(message, 3);
+
+      const booksContext =
+        relevantBooks.length > 0
+          ? relevantBooks
+              .map(
+                (book) =>
+                  `- Título: "${book.title}"\n  Autor: ${book.author}\n  Sinopse: ${book.description ?? "Sem descrição"}\n  Similaridade semântica: ${(book.similarity * 100).toFixed(1)}%`,
+              )
+              .join("\n\n")
+          : "Nenhum livro relevante encontrado no acervo.";
+
       const messages: ChatCompletionMessageParam[] = [
         {
           role: "system",
-          content: SYSTEM_PROMPT,
+          content: `${SYSTEM_PROMPT}\n\n### Obras do acervo relacionadas à consulta:\n${booksContext}`,
         },
         ...messageHistory.map((msg) => ({
           role: msg.role,
