@@ -9,7 +9,8 @@ import {
 import fastifySwagger from "@fastify/swagger";
 import fastifyApiReference from "@scalar/fastify-api-reference";
 
-import { booksRoutes } from "./routes";
+import { booksRoutes } from "@/modules/book/book.routes";
+import { chatRoutes } from "@/modules/chat/chat.routes";
 
 export const app = fastify({
   routerOptions: {
@@ -21,8 +22,17 @@ app.register(fastifySwagger, {
   openapi: {
     info: {
       title: "Librarium API",
-      description: "API para gerenciamento de livros",
+      description: "API for managing books and chat assistant interactions",
       version: "1.0.0",
+    },
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: "http",
+          scheme: "bearer",
+          description: "Insira sua API key no formato: Bearer <token>",
+        },
+      },
     },
   },
   transform: jsonSchemaTransform,
@@ -35,4 +45,7 @@ app.register(fastifyApiReference, {
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
 
+app.decorateRequest("token", null);
+
 app.register(booksRoutes, { prefix: "/books" });
+app.register(chatRoutes, { prefix: "/chat" });

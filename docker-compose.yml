@@ -1,18 +1,30 @@
 services:
   librarium-pg:
     container_name: librarium-pg
-    image: bitnami/postgresql
+    image: pgvector/pgvector:pg17
     restart: always
     environment:
-      - POSTGRESQL_USERNAME=dev
-      - POSTGRESQL_PASSWORD=dev
-      - POSTGRESQL_DATABASE=librarium
-      - POSTGRESQL_POSTGRES_PASSWORD=dev
+      - POSTGRES_USER=dev
+      - POSTGRES_PASSWORD=dev
+      - POSTGRES_DB=librarium
     ports:
       - '5432:5432'
     volumes:
-      - pgdata:/bitnami/postgresql
+      - pgvector_data:/var/lib/postgresql/data
+    
+  librarium-redis:
+    container_name: librarium-redis
+    image: bitnami/redis:latest
+    restart: always
+    environment:
+      - ALLOW_EMPTY_PASSWORD=yes
+    ports:
+      - '6379:6379'
+    volumes:
+      - redisdata:/bitnami/redis/data
 
 volumes:
-  pgdata:
+  pgvector_data:
+    driver: local
+  redisdata:
     driver: local
