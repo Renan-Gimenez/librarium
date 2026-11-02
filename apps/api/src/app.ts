@@ -9,9 +9,7 @@ import {
 import fastifySwagger from "@fastify/swagger";
 import fastifyApiReference from "@scalar/fastify-api-reference";
 
-import { booksRoutes } from "@/modules/book/book.routes";
-import { chatRoutes } from "@/modules/chat/chat.routes";
-import { genresRoutes } from "@/modules/genre/genre.routes";
+import { appRoutes } from "@/modules/routes";
 
 export const app = fastify({
   routerOptions: {
@@ -48,6 +46,4 @@ app.setSerializerCompiler(serializerCompiler);
 
 app.decorateRequest("token", null);
 
-app.register(booksRoutes, { prefix: "/books" });
-app.register(chatRoutes, { prefix: "/chat" });
-app.register(genresRoutes, { prefix: "/genres" });
+app.register(appRoutes, { prefix: "/api" });

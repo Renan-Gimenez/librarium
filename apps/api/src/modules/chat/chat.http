@@ -1,4 +1,4 @@
-@baseURL = http://localhost:3333
+@baseURL = http://localhost:3333/api
 @token = b8b7b5d9-ee2e-4580-ab77-b3092a93a409
 
 POST {{baseURL}}/chat
