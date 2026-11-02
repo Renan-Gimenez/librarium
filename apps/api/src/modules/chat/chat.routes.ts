@@ -68,10 +68,13 @@ export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
       const booksContext =
         relevantBooks.length > 0
           ? relevantBooks
-              .map(
-                (book) =>
-                  `- Título: "${book.title}"\n  Autor: ${book.author}\n  Sinopse: ${book.description ?? "Sem descrição"}\n  Similaridade semântica: ${(book.similarity * 100).toFixed(1)}%`,
-              )
+              .map((book) => {
+                const genres = book.genres?.map((g) => g.name).join(", ");
+                const dateStr = book.createdAt
+                  ? new Date(book.createdAt).toISOString()
+                  : null;
+                return `- Título: "${book.title}"\n  Autor: ${book.author}${genres ? `\n  Gêneros: ${genres}` : ""}${dateStr ? `\n  Cadastrado no catálogo em: ${dateStr}` : ""}\n  Sinopse: ${book.description ?? "Sem descrição"}\n  Similaridade semântica: ${(book.similarity * 100).toFixed(1)}%`;
+              })
               .join("\n\n")
           : "Nenhum livro relevante encontrado no acervo.";
 
