@@ -4,3 +4,6 @@ export * from "./button.js";
 export * from "./input.js";
 export * from "./search-bar.js";
 export * from "./badge.js";
+export * from "./genre-chip.js";
+export * from "./star-rating.js";
+export * from "./skeleton.js";
