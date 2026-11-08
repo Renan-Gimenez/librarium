@@ -12,6 +12,7 @@ import fastifyCors from "@fastify/cors";
 import fastifyRateLimit from "@fastify/rate-limit";
 
 import { env } from "@/config/env";
+import { errorHandler } from "@/errors";
 import { redis } from "@/lib/redis";
 import { appRoutes } from "@/modules/routes";
 
@@ -67,6 +68,8 @@ if (env.NODE_ENV !== "production") {
 
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
+
+app.setErrorHandler(errorHandler);
 
 app.decorateRequest("token", null);
 
