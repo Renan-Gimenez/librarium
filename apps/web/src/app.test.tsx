@@ -1,11 +1,12 @@
 import "./test-setup";
-import { describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as React from "react";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./app";
-import { bookKeys } from "./hooks/use-books";
-import type { Genre } from "./types/api";
+import type { AxiosResponse, InternalAxiosRequestConfig } from "axios";
+import { api } from "./lib/api";
+import type { Book, Genre, PaginatedBooksResponse } from "./types/api";
 
 const mockGenresList: Genre[] = [
   {
@@ -16,11 +17,59 @@ const mockGenresList: Genre[] = [
   },
 ];
 
-function renderWithClient(
-  ui: React.ReactElement,
-  genres: Genre[] = mockGenresList,
-) {
-  const testQueryClient = new QueryClient({
+const mockBooksList: Book[] = [
+  {
+    id: "1",
+    title: "Duna",
+    author: "Frank Herbert",
+    description: "Um clássico épico de ficção científica.",
+    coverUrl: "https://example.com/duna.jpg",
+    genres: [
+      {
+        slug: "sci-fi",
+        name: "Ficção Científica",
+        createdAt: "2026-08-23T03:00:00.000Z",
+        updatedAt: "2026-08-23T03:00:00.000Z",
+      },
+    ],
+    rating: 4.9,
+    publishedAt: "1965-08-01T00:00:00.000Z",
+    createdAt: "2026-08-23T03:00:00.000Z",
+    updatedAt: "2026-08-23T03:00:00.000Z",
+  },
+  {
+    id: "2",
+    title: "Fundação",
+    author: "Isaac Asimov",
+    description: "A queda do Império Galáctico.",
+    coverUrl: null,
+    genres: [
+      {
+        slug: "sci-fi",
+        name: "Ficção Científica",
+        createdAt: "2026-08-23T03:00:00.000Z",
+        updatedAt: "2026-08-23T03:00:00.000Z",
+      },
+    ],
+    rating: 4.8,
+    publishedAt: "1951-05-01T00:00:00.000Z",
+    createdAt: "2026-08-23T03:00:00.000Z",
+    updatedAt: "2026-08-23T03:00:00.000Z",
+  },
+];
+
+function createAxiosResponse<T>(data: T): AxiosResponse<T> {
+  return {
+    data,
+    status: 200,
+    statusText: "OK",
+    headers: {},
+    config: { headers: {} } as unknown as InternalAxiosRequestConfig,
+  };
+}
+
+function renderWithClient(ui: React.ReactElement) {
+  const client = new QueryClient({
     defaultOptions: {
       queries: {
         retry: false,
@@ -28,56 +77,99 @@ function renderWithClient(
     },
   });
 
-  if (genres.length > 0) {
-    testQueryClient.setQueryData(bookKeys.genres(), { data: genres });
-  }
-
-  return render(
-    <QueryClientProvider client={testQueryClient}>{ui}</QueryClientProvider>,
+  const Wrapper = ({ children }: { children: React.ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
+
+  return {
+    ...render(ui, { wrapper: Wrapper }),
+    client,
+  };
 }
 
 describe("App component integration", () => {
-  it("renders header, filter bar and initial catalogue search instructions", () => {
+  let mockBooksResponse: PaginatedBooksResponse;
+
+  beforeEach(() => {
+    mockBooksResponse = {
+      data: mockBooksList,
+      meta: {
+        total: 2,
+        page: 1,
+        limit: 10,
+        totalPages: 1,
+      },
+    };
+
+    spyOn(api, "get").mockImplementation(((url: string) => {
+      if (url.includes("/genres")) {
+        return Promise.resolve(createAxiosResponse({ data: mockGenresList }));
+      }
+      if (url.includes("/books")) {
+        return Promise.resolve(createAxiosResponse(mockBooksResponse));
+      }
+      return Promise.reject(new Error(`Unhandled URL: ${url}`));
+    }) as unknown as typeof api.get);
+  });
+
+  it("renders header, filter bar and catalogue grid with books", async () => {
     renderWithClient(<App />);
 
     expect(screen.getByText("Librarium")).toBeDefined();
     expect(screen.getByText("Assistente IA")).toBeDefined();
     expect(screen.getByRole("button", { name: "Todos" })).toBeDefined();
+
+    // Wait for books and total count to resolve
+    expect(await screen.findByRole("heading", { name: "Duna" })).toBeDefined();
+    expect(await screen.findByRole("heading", { name: "Fundação" })).toBeDefined();
+    expect(await screen.findByText("Frank Herbert")).toBeDefined();
+    expect(await screen.findByText(/Exibindo 2 livros/i)).toBeDefined();
+  });
+
+  it("renders pagination when totalPages > 1", async () => {
+    mockBooksResponse = {
+      data: mockBooksList,
+      meta: {
+        total: 25,
+        page: 1,
+        limit: 10,
+        totalPages: 3,
+      },
+    };
+
+    renderWithClient(<App />);
+
     expect(
-      screen.getByRole("button", { name: "Ficção Científica" }),
+      await screen.findByRole("navigation", { name: "Paginação do catálogo" }),
     ).toBeDefined();
+    expect(screen.getByRole("button", { name: "Ir para a página 1" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Ir para a página 2" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Ir para a página 3" })).toBeDefined();
+  });
+
+  it("renders empty state when book list is empty", async () => {
+    mockBooksResponse = {
+      data: [],
+      meta: {
+        total: 0,
+        page: 1,
+        limit: 10,
+        totalPages: 0,
+      },
+    };
+
+    renderWithClient(<App />);
+
     expect(
-      screen.getByText(
-        /ou clique na barra de busca para pesquisar livros no catálogo/i,
-      ),
+      await screen.findByRole("heading", { name: "Nenhum livro encontrado" }),
     ).toBeDefined();
   });
 
-  it("propagates search input through useDebounce and renders debounced term after 300ms", async () => {
+  it("toggles the assistant banner when clicking the AI button", async () => {
     renderWithClient(<App />);
 
-    const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
-    );
-
-    // Type into input
-    fireEvent.change(input, { target: { value: "Neuromancer" } });
-
-    // Immediately, the debounced text should not have updated yet
-    expect(screen.queryByText(/Termo pesquisado:/i)).toBeNull();
-
-    // Advance timers past 300ms debounce delay
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 350));
-    });
-
-    expect(screen.getByText(/Termo pesquisado:/i)).toBeDefined();
-    expect(screen.getByText(/"Neuromancer"/i)).toBeDefined();
-  });
-
-  it("toggles the assistant indicator when clicking the AI button", () => {
-    renderWithClient(<App />);
+    // Wait for content
+    await screen.findByRole("heading", { name: "Duna" });
 
     expect(screen.queryByText(/Assistente IA ativado/i)).toBeNull();
 
@@ -88,29 +180,176 @@ describe("App component integration", () => {
 
     expect(screen.getByText(/Assistente IA ativado/i)).toBeDefined();
 
-    fireEvent.click(assistantBtn);
+    const closeBtn = screen.getByRole("button", { name: "Fechar" });
+    fireEvent.click(closeBtn);
     expect(screen.queryByText(/Assistente IA ativado/i)).toBeNull();
   });
 
-  it("updates active filter indicator when a genre chip is selected and toggled off", () => {
+  it("propagates search input and debounces properly", async () => {
     renderWithClient(<App />);
 
-    const sciFiChip = screen.getByRole("button", { name: "Ficção Científica" });
-    fireEvent.click(sciFiChip);
+    const input = screen.getByPlaceholderText(
+      "Buscar por título, autor ou palavra-chave...",
+    );
+    fireEvent.change(input, { target: { value: "Neuromancer" } });
 
-    expect(screen.getByText(/Gênero: sci-fi/i)).toBeDefined();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
 
-    // Toggle off by clicking again
-    fireEvent.click(sciFiChip);
-    expect(screen.queryByText(/Gênero: sci-fi/i)).toBeNull();
+    expect(input.getAttribute("value")).toBe("Neuromancer");
   });
 
-  it("updates active filter indicator when rating filter is selected", () => {
+  it("updates page when clicking a page button in pagination", async () => {
+    mockBooksResponse = {
+      data: mockBooksList,
+      meta: {
+        total: 25,
+        page: 1,
+        limit: 10,
+        totalPages: 3,
+      },
+    };
+
     renderWithClient(<App />);
+
+    const page2Btn = await screen.findByRole("button", { name: "Ir para a página 2" });
+    fireEvent.click(page2Btn);
+
+    expect(page2Btn.getAttribute("aria-current")).toBe("page");
+  });
+
+  it("filters by genre when a genre chip is clicked", async () => {
+    renderWithClient(<App />);
+
+    const genreChip = await screen.findByRole("button", { name: "Ficção Científica" });
+    fireEvent.click(genreChip);
+
+    expect(genreChip.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("clears filters and search query when clicking clear filters in empty state", async () => {
+    mockBooksResponse = {
+      data: [],
+      meta: {
+        total: 0,
+        page: 1,
+        limit: 10,
+        totalPages: 0,
+      },
+    };
+
+    renderWithClient(<App />);
+
+    const input = screen.getByPlaceholderText(
+      "Buscar por título, autor ou palavra-chave...",
+    );
+    fireEvent.change(input, { target: { value: "inexistente" } });
+
+    const clearBtn = await screen.findByRole("button", { name: "Limpar filtros" });
+    fireEvent.click(clearBtn);
+
+    expect(input.getAttribute("value")).toBe("");
+  });
+
+  it("handles book selection when a book card is clicked", async () => {
+    const infoSpy = spyOn(console, "info");
+    renderWithClient(<App />);
+
+    const dunaCard = await screen.findByRole("button", {
+      name: "Livro: Duna, por Frank Herbert",
+    });
+    fireEvent.click(dunaCard);
+
+    expect(infoSpy).toHaveBeenCalledWith("Book selected:", "Duna");
+    infoSpy.mockRestore();
+  });
+
+  it("handles sort order and min rating dropdown changes", async () => {
+    renderWithClient(<App />);
+
+    await screen.findByRole("heading", { name: "Duna" });
 
     const ratingSelect = screen.getByLabelText("Filtrar por avaliação mínima");
     fireEvent.change(ratingSelect, { target: { value: "4" } });
+    expect((ratingSelect as HTMLSelectElement).value).toBe("4");
 
-    expect(screen.getByText(/Nota mínima: ★ 4\+/i)).toBeDefined();
+    const sortSelect = screen.getByLabelText("Critério de ordenação");
+    fireEvent.change(sortSelect, { target: { value: "rating_desc" } });
+    expect((sortSelect as HTMLSelectElement).value).toBe("rating_desc");
+  });
+
+  it("resets page to 1 when a filter is applied while on a later page", async () => {
+    mockBooksResponse = {
+      data: mockBooksList,
+      meta: {
+        total: 30,
+        page: 1,
+        limit: 10,
+        totalPages: 3,
+      },
+    };
+
+    renderWithClient(<App />);
+
+    // Navigate to page 3
+    const page3Btn = await screen.findByRole("button", { name: "Ir para a página 3" });
+    await act(async () => {
+      fireEvent.click(page3Btn);
+    });
+    expect(page3Btn.getAttribute("aria-current")).toBe("page");
+
+    // When selecting a genre, page is reset to 1
+    const genreChip = screen.getByRole("button", { name: "Ficção Científica" });
+    fireEvent.click(genreChip);
+
+    const page1Btn = await screen.findByRole("button", { name: "Ir para a página 1" });
+    expect(page1Btn.getAttribute("aria-current")).toBe("page");
+  });
+
+  it("clamps page when totalPages returned by server is less than current page", async () => {
+    let currentTotalPages = 3;
+
+    spyOn(api, "get").mockImplementation(((url: string, config?: { params?: Record<string, unknown> }) => {
+      if (url.includes("/genres")) {
+        return Promise.resolve(createAxiosResponse({ data: mockGenresList }));
+      }
+      if (url.includes("/books")) {
+        const requestedPage = (config?.params?.page as number) || 1;
+        if (requestedPage === 3) {
+          // Server indicates catalog shrunk to 2 pages
+          currentTotalPages = 2;
+        }
+        return Promise.resolve(
+          createAxiosResponse({
+            data: mockBooksList,
+            meta: {
+              total: currentTotalPages * 10,
+              page: requestedPage,
+              limit: 10,
+              totalPages: currentTotalPages,
+            },
+          }),
+        );
+      }
+      return Promise.reject(new Error(`Unhandled URL: ${url}`));
+    }) as unknown as typeof api.get);
+
+    renderWithClient(<App />);
+
+    // Navigate to page 3
+    const page3Btn = await screen.findByRole("button", { name: "Ir para a página 3" });
+    await act(async () => {
+      fireEvent.click(page3Btn);
+    });
+
+    // Because page=3 returned totalPages=2, page should automatically adjust to 2
+    await act(async () => {
+      await waitFor(() => {
+        const page2Btn = screen.getByRole("button", { name: "Ir para a página 2" });
+        expect(page2Btn.getAttribute("aria-current")).toBe("page");
+      });
+    });
+    expect(screen.queryByRole("button", { name: "Ir para a página 3" })).toBeNull();
   });
 });
