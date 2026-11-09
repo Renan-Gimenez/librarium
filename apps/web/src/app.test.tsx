@@ -252,8 +252,7 @@ describe("App component integration", () => {
     expect(input.getAttribute("value")).toBe("");
   });
 
-  it("handles book selection when a book card is clicked", async () => {
-    const infoSpy = spyOn(console, "info");
+  it("handles book selection when a book card is clicked and opens BookDetailsModal", async () => {
     renderWithClient(<App />);
 
     const dunaCard = await screen.findByRole("button", {
@@ -261,8 +260,33 @@ describe("App component integration", () => {
     });
     fireEvent.click(dunaCard);
 
-    expect(infoSpy).toHaveBeenCalledWith("Book selected:", "Duna");
-    infoSpy.mockRestore();
+    expect(await screen.findByRole("dialog")).toBeDefined();
+    expect(screen.getByText("Um clássico épico de ficção científica.")).toBeDefined();
+
+    const closeButtons = screen.getAllByRole("button", { name: "Fechar" });
+    fireEvent.click(closeButtons[0]);
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("opens AI assistant and closes modal when clicking 'Perguntar à IA' inside modal", async () => {
+    renderWithClient(<App />);
+
+    const dunaCard = await screen.findByRole("button", {
+      name: "Livro: Duna, por Frank Herbert",
+    });
+    fireEvent.click(dunaCard);
+
+    expect(await screen.findByRole("dialog")).toBeDefined();
+
+    const askAIBtn = screen.getByRole("button", {
+      name: "Perguntar à IA sobre este livro",
+    });
+    fireEvent.click(askAIBtn);
+
+    // Modal should close and AI banner should be visible
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText(/Assistente IA ativado/i)).toBeDefined();
   });
 
   it("handles sort order and min rating dropdown changes", async () => {
