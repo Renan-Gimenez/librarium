@@ -7,3 +7,4 @@ export * from "./badge.js";
 export * from "./genre-chip.js";
 export * from "./star-rating.js";
 export * from "./skeleton.js";
+export * from "./dialog.js";

@@ -3,6 +3,7 @@ import { Header } from "./components/header";
 import { FilterBar } from "./components/filter-bar";
 import { BookGrid } from "./components/book-grid";
 import { Pagination } from "./components/pagination";
+import { BookDetailsModal } from "./components/book-details-modal";
 import { useDebounce } from "./hooks/use-debounce";
 import { useBooks, useGenres } from "./hooks/use-books";
 import type { Book, BookSortBy, SortOrder } from "./types/api";
@@ -13,6 +14,7 @@ export function App() {
   const [search, setSearch] = React.useState("");
   const debouncedSearch = useDebounce(search, 300);
   const [isAssistantOpen, setIsAssistantOpen] = React.useState(false);
+  const [selectedBook, setSelectedBook] = React.useState<Book | null>(null);
 
   // Filter States
   const [selectedGenre, setSelectedGenre] = React.useState<
@@ -94,9 +96,7 @@ export function App() {
   };
 
   const handleSelectBook = (book: Book) => {
-    // Epic 2: will open BookDetailsModal
-    // For now, log selection
-    console.info("Book selected:", book.title);
+    setSelectedBook(book);
   };
 
   const hasActiveFilters = Boolean(
@@ -167,6 +167,17 @@ export function App() {
             onPageChange={handlePageChange}
           />
         )}
+
+        <BookDetailsModal
+          book={selectedBook}
+          isOpen={Boolean(selectedBook)}
+          onClose={() => setSelectedBook(null)}
+          onAskAI={(book) => {
+            setSelectedBook(null);
+            setIsAssistantOpen(true);
+            console.info("Ask AI about:", book.title);
+          }}
+        />
       </main>
     </div>
   );
