@@ -60,3 +60,29 @@ export interface BooksQueryParams {
   order?: SortOrder;
 }
 
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt?: string;
+}
+
+export interface ChatApiRequest {
+  message: string;
+}
+
+export interface ChatApiResponse {
+  data: {
+    userMessage: string;
+    modelReply: string;
+  };
+  meta: {
+    usage: {
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+    };
+  };
+}
+
+

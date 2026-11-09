@@ -1,4 +1,5 @@
 import * as React from "react";
+import axios from "axios";
 import { ArrowUp, Sparkles, X } from "lucide-react";
 import {
   Sheet,
@@ -8,7 +9,22 @@ import {
   SheetTitle,
 } from "@repo/ui";
 import { useChatSession } from "@/hooks/use-chat-session";
-import type { Book } from "@/types/api";
+import { sendChatMessage } from "@/services/chat";
+import { TypingIndicator } from "@/components/typing-indicator";
+import type { ApiErrorResponse, Book, ChatMessage } from "@/types/api";
+
+function extractErrorMessage(err: unknown): string {
+  if (
+    axios.isAxiosError<ApiErrorResponse>(err) &&
+    err.response?.data?.message
+  ) {
+    return err.response.data.message;
+  }
+  if (err instanceof Error) {
+    return err.message;
+  }
+  return "Ocorreu um erro ao comunicar com o assistente.";
+}
 
 const PROMPT_STARTERS = [
   "Me indique um livro de ficção científica com comédia",
@@ -28,10 +44,16 @@ export function ChatDrawer({
   onClose,
   initialPrompt = "",
 }: ChatDrawerProps) {
-  const { touchSession } = useChatSession();
+  const { sessionId, touchSession } = useChatSession();
   const [inputValue, setInputValue] = React.useState(initialPrompt);
   const [prevPrompt, setPrevPrompt] = React.useState(initialPrompt);
+  const [messages, setMessages] = React.useState<ChatMessage[]>([]);
+  const [isLoading, setIsLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
   const inputRef = React.useRef<HTMLInputElement>(null);
+  const messagesEndRef = React.useRef<HTMLDivElement>(null);
+  const abortControllerRef = React.useRef<AbortController | null>(null);
 
   // Sync state with prop change without setState in useEffect
   if (initialPrompt !== prevPrompt) {
@@ -39,11 +61,18 @@ export function ChatDrawer({
     setInputValue(initialPrompt);
   }
 
+  const scrollToBottom = React.useCallback(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, []);
+
+  React.useEffect(() => {
+    scrollToBottom();
+  }, [messages, isLoading, error, scrollToBottom]);
+
   // Touch session and focus input when drawer opens
   React.useEffect(() => {
     if (isOpen) {
       touchSession();
-      // Small timeout to allow sheet animation and focus
       const timer = setTimeout(() => {
         inputRef.current?.focus();
       }, 100);
@@ -51,26 +80,99 @@ export function ChatDrawer({
     }
   }, [isOpen, touchSession]);
 
+  // Abort pending request when drawer closes or unmounts
+  React.useEffect(() => {
+    if (!isOpen) {
+      abortControllerRef.current?.abort();
+    }
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, [isOpen]);
+
   const handleStarterClick = (starter: string) => {
     setInputValue(starter);
     inputRef.current?.focus();
   };
 
+  const handleSendMessage = async (textToSend: string, isRetry = false) => {
+    const trimmed = textToSend.trim();
+    if (!trimmed || isLoading) return;
+
+    touchSession();
+    if (!isRetry) {
+      setInputValue("");
+    }
+    setError(null);
+
+    if (!isRetry) {
+      const userMessage: ChatMessage = {
+        id: `user-${Date.now()}`,
+        role: "user",
+        content: trimmed,
+        createdAt: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, userMessage]);
+    }
+
+    setIsLoading(true);
+
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = new AbortController();
+
+    try {
+      const response = await sendChatMessage(
+        {
+          message: trimmed,
+          sessionId,
+        },
+        { signal: abortControllerRef.current.signal }
+      );
+
+      const replyContent =
+        response.data.modelReply?.trim() ||
+        "Não consegui formular uma recomendação para este pedido. Poderia reformular a pergunta?";
+
+      const assistantMessage: ChatMessage = {
+        id: `assistant-${Date.now()}`,
+        role: "assistant",
+        content: replyContent,
+        createdAt: new Date().toISOString(),
+      };
+
+      setMessages((prev) => [...prev, assistantMessage]);
+      touchSession();
+    } catch (err: unknown) {
+      if (axios.isCancel(err)) {
+        return;
+      }
+      setError(extractErrorMessage(err));
+    } finally {
+      setIsLoading(false);
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 50);
+    }
+  };
+
+  const handleRetry = () => {
+    if (isLoading) return;
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+    if (!lastUserMsg) return;
+
+    handleSendMessage(lastUserMsg.content, true);
+  };
+
   const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      // Future Story 3.2: send message to API
-      if (inputValue.trim()) {
-        touchSession();
-      }
+      handleSendMessage(inputValue);
     }
   };
 
   const handleSend = (event: React.FormEvent) => {
     event.preventDefault();
-    if (inputValue.trim()) {
-      touchSession();
-    }
+    handleSendMessage(inputValue);
   };
 
   return (
@@ -107,7 +209,7 @@ export function ChatDrawer({
         </SheetHeader>
 
         {/* Chat Body (Scrollable) */}
-        <div className="flex flex-1 min-h-0 flex-col gap-6 overflow-y-auto p-4 sm:p-6">
+        <div className="flex flex-1 min-h-0 flex-col gap-4 overflow-y-auto p-4 sm:p-6">
           {/* Welcome Message Bubble */}
           <div className="rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-4 shadow-sm">
             <p className="font-ui text-[13.5px] leading-[1.55] text-[#F4F4F6]">
@@ -118,24 +220,91 @@ export function ChatDrawer({
             </p>
           </div>
 
-          {/* Starters Section */}
-          <div className="flex flex-col gap-2.5">
-            <span className="font-ui text-[10px] font-semibold uppercase tracking-wider text-[#A1A1AA]">
-              Sugestões para começar
-            </span>
-            <div className="flex flex-col gap-2">
-              {PROMPT_STARTERS.map((starter) => (
-                <button
-                  key={starter}
-                  type="button"
-                  onClick={() => handleStarterClick(starter)}
-                  className="w-full cursor-pointer rounded-[10px] border border-[#272A34] bg-[#14161B] p-3 text-left font-ui text-[12.5px] leading-snug text-[#F4F4F6] transition-colors hover:border-[#3A3E4A] hover:bg-[#1C1F26] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
-                >
-                  {starter}
-                </button>
-              ))}
+          {/* Starters Section (when no messages yet) */}
+          {messages.length === 0 && (
+            <div className="flex flex-col gap-2.5">
+              <span className="font-ui text-[10px] font-semibold uppercase tracking-wider text-[#A1A1AA]">
+                Sugestões para começar
+              </span>
+              <div className="flex flex-col gap-2">
+                {PROMPT_STARTERS.map((starter) => (
+                  <button
+                    key={starter}
+                    type="button"
+                    onClick={() => handleStarterClick(starter)}
+                    className="w-full cursor-pointer rounded-[10px] border border-[#272A34] bg-[#14161B] p-3 text-left font-ui text-[12.5px] leading-snug text-[#F4F4F6] transition-colors hover:border-[#3A3E4A] hover:bg-[#1C1F26] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
+                  >
+                    {starter}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
+
+          {/* Messages List */}
+          {messages.map((message) => {
+            if (message.role === "user") {
+              return (
+                <div key={message.id} className="flex justify-end">
+                  <div className="max-w-[85%] rounded-[14px_14px_4px_14px] bg-[#7C3AED] px-3.5 py-2.5 shadow-sm">
+                    <p className="font-ui text-[13.5px] leading-[1.45] text-white whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                      {message.content}
+                    </p>
+                  </div>
+                </div>
+              );
+            }
+
+            return (
+              <div key={message.id} className="flex items-start gap-2.5">
+                <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#7C3AED] text-white mt-0.5">
+                  <Sparkles className="h-[13px] w-[13px]" aria-hidden="true" />
+                </div>
+                <div className="flex-1 rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-3.5 shadow-sm">
+                  <p className="font-ui text-[13.5px] leading-[1.5] text-[#F4F4F6] whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                    {message.content}
+                  </p>
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Typing Indicator while waiting for response */}
+          {isLoading && (
+            <div className="flex items-start gap-2.5">
+              <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#7C3AED] text-white mt-0.5">
+                <Sparkles className="h-[13px] w-[13px]" aria-hidden="true" />
+              </div>
+              <TypingIndicator />
+            </div>
+          )}
+
+          {/* Error Banner with Retry */}
+          {error && (
+            <div className="flex items-start gap-2.5">
+              <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-red-500/20 text-red-400 mt-0.5">
+                <X className="h-[13px] w-[13px]" aria-hidden="true" />
+              </div>
+              <div
+                role="alert"
+                className="flex flex-1 flex-col gap-2 rounded-[4px_14px_14px_14px] border border-red-500/30 bg-red-950/20 p-3.5 shadow-sm text-left"
+              >
+                <p className="font-ui text-[13px] text-red-200">
+                  {error}
+                </p>
+                <button
+                  type="button"
+                  onClick={handleRetry}
+                  className="self-start cursor-pointer rounded-[8px] border border-red-500/40 bg-red-900/40 px-3 py-1.5 font-ui text-[12px] font-medium text-red-100 transition-colors hover:bg-red-900/60"
+                >
+                  Tentar novamente
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Anchor to scroll */}
+          <div ref={messagesEndRef} />
         </div>
 
         {/* Chat Footer */}
@@ -150,13 +319,14 @@ export function ChatDrawer({
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={handleKeyDown}
+              disabled={isLoading}
               aria-label="Mensagem para o assistente literário"
-              placeholder="Pergunte sobre o acervo..."
-              className="flex-1 rounded-[12px] border border-[#272A34] bg-[#0C0D10] px-3.5 py-2.5 text-[13.5px] text-[#F4F4F6] placeholder:text-[#71717A] dark:placeholder:text-[#A1A1AA] outline-none transition-colors focus:border-[#7C3AED] focus:ring-1 focus:ring-[#7C3AED]"
+              placeholder={isLoading ? "Aguarde a resposta..." : "Pergunte sobre o acervo..."}
+              className="flex-1 rounded-[12px] border border-[#272A34] bg-[#0C0D10] px-3.5 py-2.5 text-[13.5px] text-[#F4F4F6] placeholder:text-[#71717A] dark:placeholder:text-[#A1A1AA] outline-none transition-colors focus:border-[#7C3AED] focus:ring-1 focus:ring-[#7C3AED] disabled:opacity-50"
             />
             <button
               type="submit"
-              disabled={!inputValue.trim()}
+              disabled={!inputValue.trim() || isLoading}
               aria-label="Enviar mensagem"
               className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-[10px] bg-[#7C3AED] text-white transition-colors hover:bg-[#6D28D9] disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
             >

@@ -1,7 +1,8 @@
 import "../test-setup";
-import { describe, expect, it, mock } from "bun:test";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, expect, it, mock, spyOn } from "bun:test";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ChatDrawer } from "./chat-drawer";
+import * as chatService from "@/services/chat";
 
 const EXPECTED_STARTERS = [
   "Me indique um livro de ficção científica com comédia",
@@ -18,7 +19,6 @@ describe("ChatDrawer Component", () => {
     expect(screen.getByText(/Sou o consultor literário do Librarium/i)).toBeDefined();
     expect(screen.getByText("Sugestões para começar")).toBeDefined();
 
-    // All 3 starters must be present
     for (const starter of EXPECTED_STARTERS) {
       expect(screen.getByRole("button", { name: starter })).toBeDefined();
     }
@@ -66,6 +66,143 @@ describe("ChatDrawer Component", () => {
     expect(sendBtn.disabled).toBe(false);
   });
 
+  it("sends message to API, shows user bubble, typing indicator, and then assistant reply", async () => {
+    const sendSpy = spyOn(chatService, "sendChatMessage").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(
+            () =>
+              resolve({
+                data: {
+                  userMessage: "Livros de fantasia",
+                  modelReply: "Recomendo O Hobbit e O Senhor dos Anéis.",
+                },
+                meta: {
+                  usage: {
+                    promptTokens: 10,
+                    completionTokens: 15,
+                    totalTokens: 25,
+                  },
+                },
+              }),
+            50
+          );
+        })
+    );
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Livros de fantasia" } });
+
+    const sendBtn = screen.getByRole("button", { name: "Enviar mensagem" });
+    fireEvent.click(sendBtn);
+
+    // User message bubble appears immediately
+    expect(screen.getByText("Livros de fantasia")).toBeDefined();
+
+    // Typing indicator should appear
+    expect(screen.getByRole("status")).toBeDefined();
+    expect(screen.getByText("gerando resposta...")).toBeDefined();
+
+    // Assistant response arrives
+    await waitFor(() => {
+      expect(
+        screen.getByText("Recomendo O Hobbit e O Senhor dos Anéis.")
+      ).toBeDefined();
+    });
+
+    // Typing indicator is removed
+    expect(screen.queryByRole("status")).toBeNull();
+
+    sendSpy.mockRestore();
+  });
+
+  it("displays error banner with retry button when API fails and successfully retries", async () => {
+    let callCount = 0;
+    const sendSpy = spyOn(chatService, "sendChatMessage").mockImplementation(
+      async () => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error("Falha na conexão com a API.");
+        }
+        return {
+          data: {
+            userMessage: "Teste falha",
+            modelReply: "Recuperado após retry com sucesso!",
+          },
+          meta: {
+            usage: {
+              promptTokens: 5,
+              completionTokens: 5,
+              totalTokens: 10,
+            },
+          },
+        };
+      }
+    );
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Teste falha" } });
+
+    const sendBtn = screen.getByRole("button", { name: "Enviar mensagem" });
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Falha na conexão com a API/i)).toBeDefined();
+    });
+
+    const retryBtn = screen.getByRole("button", { name: "Tentar novamente" });
+    expect(retryBtn).toBeDefined();
+
+    // Click retry
+    fireEvent.click(retryBtn);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Recuperado após retry com sucesso!")
+      ).toBeDefined();
+    });
+
+    // Error is dismissed
+    expect(screen.queryByText(/Falha na conexão com a API/i)).toBeNull();
+
+    sendSpy.mockRestore();
+  });
+
+  it("extracts custom API error message from Axios response", async () => {
+    const axiosError = {
+      isAxiosError: true,
+      response: {
+        data: {
+          message: "Rate limit excedido. Aguarde 1 minuto.",
+        },
+      },
+    };
+
+    const sendSpy = spyOn(chatService, "sendChatMessage").mockRejectedValueOnce(
+      axiosError
+    );
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Pergunta rápida" } });
+
+    const sendBtn = screen.getByRole("button", { name: "Enviar mensagem" });
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Rate limit excedido\. Aguarde 1 minuto\./i)
+      ).toBeDefined();
+    });
+
+    sendSpy.mockRestore();
+  });
+
   it("invokes onClose when clicking the close button", () => {
     const onClose = mock();
     render(<ChatDrawer isOpen={true} onClose={onClose} />);
@@ -100,13 +237,13 @@ describe("ChatDrawer Component", () => {
       <ChatDrawer
         isOpen={true}
         onClose={() => {}}
-        initialPrompt="Me fale sobre Duna"
+        initialPrompt="Conte mais sobre o livro Neuromancer"
       />
     );
 
     const input = screen.getByPlaceholderText(
       "Pergunte sobre o acervo..."
     ) as HTMLInputElement;
-    expect(input.value).toBe("Me fale sobre Duna");
+    expect(input.value).toBe("Conte mais sobre o livro Neuromancer");
   });
 });
