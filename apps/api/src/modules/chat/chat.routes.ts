@@ -38,6 +38,28 @@ export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
             data: z.object({
               userMessage: z.string(),
               modelReply: z.string(),
+              books: z
+                .array(
+                  z.object({
+                    id: z.string(),
+                    title: z.string(),
+                    author: z.string(),
+                    description: z.string().nullable().optional(),
+                    coverUrl: z.string().nullable().optional(),
+                    rating: z.number().nullable().optional(),
+                    publishedAt: z.string().nullable().optional(),
+                    genres: z
+                      .array(
+                        z.object({
+                          slug: z.string(),
+                          name: z.string(),
+                        })
+                      )
+                      .optional(),
+                    similarity: z.number().optional(),
+                  })
+                )
+                .optional(),
             }),
             meta: z.object({
               usage: z.object({
@@ -133,11 +155,41 @@ export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
       await redis.set(redisKey, JSON.stringify(updatedHistory));
       await redis.expire(redisKey, env.CHAT_SESSION_TTL);
 
+      const citedBooks = relevantBooks
+        .filter((b) => {
+          const normReply = modelReply.toLowerCase();
+          const normTitle = b.title.toLowerCase();
+          const hasWordMatch =
+            normTitle.length >= 3 &&
+            new RegExp(
+              `\\b${normTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
+              "i"
+            ).test(normReply);
+          return hasWordMatch || b.similarity >= 0.7;
+        })
+        .map((b) => ({
+          id: b.id,
+          title: b.title,
+          author: b.author,
+          description: b.description,
+          coverUrl: b.coverUrl,
+          rating:
+            b.rating !== null && b.rating !== undefined
+              ? Number(b.rating)
+              : null,
+          publishedAt: b.publishedAt
+            ? new Date(b.publishedAt).toISOString()
+            : null,
+          genres: b.genres,
+          similarity: Math.round(b.similarity * 100),
+        }));
+
       res.status(200);
       return {
         data: {
           userMessage: message,
           modelReply,
+          books: citedBooks,
         },
         meta: {
           usage: {

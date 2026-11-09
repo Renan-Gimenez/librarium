@@ -157,6 +157,7 @@ export const DialogContent = React.forwardRef<
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
+        event.stopPropagation();
         onOpenChangeRef.current(false);
         return;
       }

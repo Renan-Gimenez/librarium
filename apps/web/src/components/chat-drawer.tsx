@@ -11,6 +11,7 @@ import {
 import { useChatSession } from "@/hooks/use-chat-session";
 import { sendChatMessage } from "@/services/chat";
 import { TypingIndicator } from "@/components/typing-indicator";
+import { AiCitationCard } from "@/components/ai-citation-card";
 import type { ApiErrorResponse, Book, ChatMessage } from "@/types/api";
 
 function extractErrorMessage(err: unknown): string {
@@ -43,6 +44,7 @@ export function ChatDrawer({
   isOpen,
   onClose,
   initialPrompt = "",
+  onSelectBook,
 }: ChatDrawerProps) {
   const { sessionId, touchSession } = useChatSession();
   const [inputValue, setInputValue] = React.useState(initialPrompt);
@@ -137,6 +139,7 @@ export function ChatDrawer({
         id: `assistant-${Date.now()}`,
         role: "assistant",
         content: replyContent,
+        books: response.data.books,
         createdAt: new Date().toISOString(),
       };
 
@@ -260,10 +263,23 @@ export function ChatDrawer({
                 <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#7C3AED] text-white mt-0.5">
                   <Sparkles className="h-[13px] w-[13px]" aria-hidden="true" />
                 </div>
-                <div className="flex-1 rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-3.5 shadow-sm">
+                <div className="flex flex-1 flex-col gap-2.5 rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-3.5 shadow-sm">
                   <p className="font-ui text-[13.5px] leading-[1.5] text-[#F4F4F6] whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
                     {message.content}
                   </p>
+
+                  {/* Rich Cited Book Cards */}
+                  {message.books && message.books.length > 0 && (
+                    <div className="flex flex-col gap-2 pt-1 border-t border-[#272A34]/60">
+                      {message.books.map((citedBook) => (
+                        <AiCitationCard
+                          key={citedBook.id}
+                          book={citedBook}
+                          onSelect={onSelectBook}
+                        />
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             );

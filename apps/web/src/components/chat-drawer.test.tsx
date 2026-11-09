@@ -118,6 +118,63 @@ describe("ChatDrawer Component", () => {
     sendSpy.mockRestore();
   });
 
+  it("renders rich AiCitationCard within assistant message and triggers onSelectBook on click", async () => {
+    const onSelectBook = mock();
+    const mockBookData = {
+      id: "cited-dune-1",
+      title: "Duna",
+      author: "Frank Herbert",
+      description: "Clássico da ficção científica no planeta desértico.",
+      coverUrl: "https://example.com/duna.jpg",
+      rating: 4.8,
+      similarity: 95,
+      genres: [{ slug: "sci-fi", name: "Ficção Científica" }],
+    };
+
+    const sendSpy = spyOn(chatService, "sendChatMessage").mockResolvedValueOnce({
+      data: {
+        userMessage: "Recomende Duna",
+        modelReply: "Duna é uma obra-prima de Frank Herbert.",
+        books: [mockBookData],
+      },
+      meta: {
+        usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+      },
+    });
+
+    render(
+      <ChatDrawer isOpen={true} onClose={() => {}} onSelectBook={onSelectBook} />
+    );
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Recomende Duna" } });
+
+    const sendBtn = screen.getByRole("button", { name: "Enviar mensagem" });
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Duna é uma obra-prima de Frank Herbert.")
+      ).toBeDefined();
+    });
+
+    // Rich card should be rendered
+    const citationBtn = screen.getByRole("button", {
+      name: "Ver detalhes do livro Duna",
+    });
+    expect(citationBtn).toBeDefined();
+    expect(screen.getByText("95% match")).toBeDefined();
+
+    // Clicking card invokes onSelectBook
+    fireEvent.click(citationBtn);
+    expect(onSelectBook).toHaveBeenCalledTimes(1);
+    const selected = onSelectBook.mock.calls[0][0];
+    expect(selected.id).toBe("cited-dune-1");
+    expect(selected.title).toBe("Duna");
+
+    sendSpy.mockRestore();
+  });
+
   it("displays error banner with retry button when API fails and successfully retries", async () => {
     let callCount = 0;
     const sendSpy = spyOn(chatService, "sendChatMessage").mockImplementation(

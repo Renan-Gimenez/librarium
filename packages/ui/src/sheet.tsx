@@ -184,6 +184,11 @@ export const SheetContent = React.forwardRef<HTMLDivElement, SheetContentProps>(
 
       const handleKeyDown = (event: KeyboardEvent) => {
         if (event.key === "Escape") {
+          // If another dialog modal is open on top of the sheet, let the dialog handle Escape
+          const activeDialog = document.querySelector('[role="dialog"][data-state="open"]');
+          if (activeDialog && contentRef.current && !contentRef.current.contains(activeDialog)) {
+            return;
+          }
           event.preventDefault();
           onOpenChangeRef.current(false);
           return;
@@ -191,6 +196,17 @@ export const SheetContent = React.forwardRef<HTMLDivElement, SheetContentProps>(
 
         // WAI-ARIA Focus Trap for Tab and Shift+Tab
         if (event.key === "Tab" && contentRef.current) {
+          // If another modal or dialog has opened on top of sheet, do not steal its focus
+          const activeEl = document.activeElement;
+          const isAnotherModalActive =
+            activeEl &&
+            activeEl.closest('[role="dialog"]') &&
+            !contentRef.current.contains(activeEl);
+
+          if (isAnotherModalActive) {
+            return;
+          }
+
           const focusableElements =
             contentRef.current.querySelectorAll<HTMLElement>(
               'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
@@ -204,7 +220,7 @@ export const SheetContent = React.forwardRef<HTMLDivElement, SheetContentProps>(
           const firstElement = focusableElements[0];
           const lastElement = focusableElements[focusableElements.length - 1];
 
-          if (!contentRef.current.contains(document.activeElement)) {
+          if (!contentRef.current.contains(activeEl)) {
             event.preventDefault();
             firstElement?.focus();
             return;
