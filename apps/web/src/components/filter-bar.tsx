@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowUpDown, Star } from "lucide-react";
+import { ArrowUpDown, ChevronLeft, ChevronRight, Star } from "lucide-react";
 import { GenreChip, Skeleton } from "@repo/ui";
 import type { BookSortBy, Genre, SortOrder } from "@/types/api";
 
@@ -40,6 +40,41 @@ export function FilterBar({
   totalBooks,
   className = "",
 }: FilterBarProps) {
+  const scrollContainerRef = React.useRef<HTMLDivElement>(null);
+  const [canScrollLeft, setCanScrollLeft] = React.useState(false);
+  const [canScrollRight, setCanScrollRight] = React.useState(false);
+
+  const checkScroll = React.useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    setCanScrollLeft(el.scrollLeft > 6);
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 6);
+  }, []);
+
+  React.useEffect(() => {
+    checkScroll();
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    el.addEventListener("scroll", checkScroll, { passive: true });
+    window.addEventListener("resize", checkScroll);
+    return () => {
+      el.removeEventListener("scroll", checkScroll);
+      window.removeEventListener("resize", checkScroll);
+    };
+  }, [genres, checkScroll]);
+
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    if (e.deltaY !== 0) {
+      el.scrollLeft += e.deltaY;
+    }
+  };
+
+  const scrollByAmount = (offset: number) => {
+    scrollContainerRef.current?.scrollBy({ left: offset, behavior: "smooth" });
+  };
+
   const currentKey = `${sortBy}_${sortOrder}`;
   const currentSortKey = VALID_SORT_KEYS.includes(currentKey)
     ? currentKey
@@ -63,49 +98,88 @@ export function FilterBar({
 
   return (
     <div className={`flex w-full flex-col gap-3 ${className}`}>
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        {/* Horizontal Chips List */}
-        <div
-          role="group"
-          aria-label="Filtros de gênero"
-          aria-busy={isLoadingGenres}
-          className="flex flex-1 items-center gap-2 overflow-x-auto pb-1 pt-0.5 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
-        >
-          <GenreChip
-            active={!selectedGenre}
-            onClick={() => onSelectGenre?.(undefined)}
-            aria-pressed={!selectedGenre}
-          >
-            Todos
-          </GenreChip>
-
-          {isLoadingGenres ? (
-            <>
-              <span className="sr-only">Carregando gêneros literários...</span>
-              <Skeleton className="h-[35px] w-20 shrink-0 rounded-full" />
-              <Skeleton className="h-[35px] w-24 shrink-0 rounded-full" />
-              <Skeleton className="h-[35px] w-20 shrink-0 rounded-full" />
-              <Skeleton className="h-[35px] w-28 shrink-0 rounded-full" />
-              <Skeleton className="h-[35px] w-22 shrink-0 rounded-full" />
-            </>
-          ) : (
-            genres.map((genre) => (
-              <GenreChip
-                key={genre.slug}
-                active={selectedGenre === genre.slug}
-                onClick={() =>
-                  onSelectGenre?.(
-                    selectedGenre === genre.slug ? undefined : genre.slug,
-                  )
-                }
-                aria-pressed={selectedGenre === genre.slug}
-                className="shrink-0"
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+        {/* Horizontal Chips Carousel with Scroll Controls */}
+        <div className="relative flex flex-1 min-w-0 items-center">
+          {/* Scroll Left Button */}
+          {canScrollLeft && (
+            <div className="absolute left-0 z-10 flex h-full items-center bg-gradient-to-r from-[#0C0D10] via-[#0C0D10]/90 to-transparent pr-3">
+              <button
+                type="button"
+                onClick={() => scrollByAmount(-220)}
+                aria-label="Rolar gêneros para esquerda"
+                className="flex h-7 w-7 items-center justify-center rounded-full border border-[#272A34] bg-[#14161B] text-[#A1A1AA] shadow-md transition-all hover:bg-[#1C1F26] hover:text-[#F4F4F6]"
               >
-                {genre.name}
-              </GenreChip>
-            ))
+                <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+          )}
+
+          {/* Chips Scroll Area */}
+          <div
+            ref={scrollContainerRef}
+            role="group"
+            aria-label="Filtros de gênero"
+            aria-busy={isLoadingGenres}
+            onWheel={handleWheel}
+            className="flex flex-1 items-center gap-2 overflow-x-auto scroll-smooth pb-1 pt-0.5 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+          >
+            <GenreChip
+              active={!selectedGenre}
+              onClick={() => onSelectGenre?.(undefined)}
+              aria-pressed={!selectedGenre}
+            >
+              Todos
+            </GenreChip>
+
+            {isLoadingGenres ? (
+              <>
+                <span className="sr-only">Carregando gêneros literários...</span>
+                <Skeleton className="h-[35px] w-20 shrink-0 rounded-full" />
+                <Skeleton className="h-[35px] w-24 shrink-0 rounded-full" />
+                <Skeleton className="h-[35px] w-20 shrink-0 rounded-full" />
+                <Skeleton className="h-[35px] w-28 shrink-0 rounded-full" />
+                <Skeleton className="h-[35px] w-22 shrink-0 rounded-full" />
+              </>
+            ) : (
+              genres.map((genre) => (
+                <GenreChip
+                  key={genre.slug}
+                  active={selectedGenre === genre.slug}
+                  onClick={() =>
+                    onSelectGenre?.(
+                      selectedGenre === genre.slug ? undefined : genre.slug,
+                    )
+                  }
+                  aria-pressed={selectedGenre === genre.slug}
+                  className="shrink-0"
+                >
+                  {genre.name}
+                </GenreChip>
+              ))
+            )}
+          </div>
+
+          {/* Scroll Right Button */}
+          {canScrollRight && (
+            <div className="absolute right-0 z-10 flex h-full items-center bg-gradient-to-l from-[#0C0D10] via-[#0C0D10]/90 to-transparent pl-3">
+              <button
+                type="button"
+                onClick={() => scrollByAmount(220)}
+                aria-label="Rolar gêneros para direita"
+                className="flex h-7 w-7 items-center justify-center rounded-full border border-[#272A34] bg-[#14161B] text-[#A1A1AA] shadow-md transition-all hover:bg-[#1C1F26] hover:text-[#F4F4F6]"
+              >
+                <ChevronRight className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
           )}
         </div>
+
+        {/* Vertical Divider */}
+        <div
+          className="hidden sm:block h-6 w-px bg-[#272A34] mx-1 shrink-0"
+          aria-hidden="true"
+        />
 
         {/* Filters and Controls */}
         <div className="flex shrink-0 items-center gap-2 self-start sm:self-auto">

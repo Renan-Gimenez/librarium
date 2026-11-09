@@ -38,8 +38,24 @@ export function BookCard({ book, onSelect, className = "" }: BookCardProps) {
     }
   };
 
-  const validCoverUrl = book.coverUrl?.trim() || null;
-  const hasImage = Boolean(validCoverUrl && failedUrl !== validCoverUrl);
+  const normalizedCoverUrl = React.useMemo(() => {
+    if (!book.coverUrl) return null;
+    const trimmed = book.coverUrl.trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith("//")) return `https:${trimmed}`;
+    return trimmed;
+  }, [book.coverUrl]);
+
+  const [prevCoverUrl, setPrevCoverUrl] = React.useState(normalizedCoverUrl);
+
+  if (normalizedCoverUrl !== prevCoverUrl) {
+    setPrevCoverUrl(normalizedCoverUrl);
+    setFailedUrl(null);
+  }
+
+  const hasImage = Boolean(
+    normalizedCoverUrl && failedUrl !== normalizedCoverUrl,
+  );
 
   const displayTitle = book.title?.trim() || "Sem título";
   const displayAuthor = book.author?.trim() || "Autor desconhecido";
@@ -59,12 +75,17 @@ export function BookCard({ book, onSelect, className = "" }: BookCardProps) {
       <div className="relative aspect-[2/3] w-full overflow-hidden rounded-[8px] border border-[#272A34] bg-[#14161B] transition-all duration-200 group-hover:border-[#3A3E4A] group-hover:shadow-[0_12px_28px_rgba(0,0,0,0.5)]">
         {hasImage ? (
           <img
-            src={validCoverUrl!}
+            src={normalizedCoverUrl!}
             alt={`Capa do livro ${displayTitle}`}
             loading="lazy"
+            decoding="async"
+            referrerPolicy="no-referrer"
             onError={() => {
-              if (validCoverUrl) {
-                setFailedUrl(validCoverUrl);
+              console.warn(
+                `[Librarium] Falha ao carregar imagem de capa de "${displayTitle}": ${normalizedCoverUrl}`,
+              );
+              if (normalizedCoverUrl) {
+                setFailedUrl(normalizedCoverUrl);
               }
             }}
             className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"

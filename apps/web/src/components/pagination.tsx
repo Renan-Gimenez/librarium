@@ -18,14 +18,11 @@ export function Pagination({
   onPageChange,
   className = "",
 }: PaginationProps) {
-  if (!totalPages || totalPages <= 1 || Number.isNaN(totalPages)) {
+  if (!Number.isFinite(totalPages) || totalPages <= 1) {
     return null;
   }
 
-  const safePage = Number.isFinite(page)
-    ? Math.max(1, Math.min(Math.floor(page), totalPages))
-    : 1;
-
+  const safePage = Math.max(1, Math.min(Math.floor(page || 1), totalPages));
   const pages = getPageNumbers(safePage, totalPages);
 
   return (
@@ -103,7 +100,7 @@ export function Pagination({
           <>
             <span aria-hidden="true">·</span>
             <span>
-              {Math.max(0, totalItems)} {totalItems === 1 ? "livro" : "livros"}
+              {totalItems} {totalItems === 1 ? "livro" : "livros"}
               {itemsPerPage ? ` (${itemsPerPage} por pág.)` : ""}
             </span>
           </>
