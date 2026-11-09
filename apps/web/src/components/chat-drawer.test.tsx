@@ -175,6 +175,39 @@ describe("ChatDrawer Component", () => {
     sendSpy.mockRestore();
   });
 
+  it("renders markdown formatting with strong tags and bullet points in assistant reply", async () => {
+    const sendSpy = spyOn(chatService, "sendChatMessage").mockResolvedValue({
+      data: {
+        userMessage: "Indique",
+        modelReply:
+          "Recomendo **O Alquimista** por Paulo Coelho.\n\n- **Sinopse**: Uma jornada no deserto.",
+      },
+      meta: {
+        usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+      },
+    });
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Indique" } });
+
+    const sendBtn = screen.getByRole("button", { name: "Enviar mensagem" });
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      const strongs = screen.getAllByText((content, element) => {
+        return (
+          element?.tagName.toLowerCase() === "strong" &&
+          (content === "O Alquimista" || content === "Sinopse")
+        );
+      });
+      expect(strongs.length).toBe(2);
+    });
+
+    sendSpy.mockRestore();
+  });
+
   it("displays error banner with retry button when API fails and successfully retries", async () => {
     let callCount = 0;
     const sendSpy = spyOn(chatService, "sendChatMessage").mockImplementation(

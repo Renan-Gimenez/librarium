@@ -1,5 +1,6 @@
 import * as React from "react";
 import axios from "axios";
+import ReactMarkdown from "react-markdown";
 import { ArrowUp, Sparkles, X } from "lucide-react";
 import {
   Sheet,
@@ -264,13 +265,41 @@ export function ChatDrawer({
                   <Sparkles className="h-[13px] w-[13px]" aria-hidden="true" />
                 </div>
                 <div className="flex flex-1 flex-col gap-2.5 rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-3.5 shadow-sm">
-                  <p className="font-ui text-[13.5px] leading-[1.5] text-[#F4F4F6] whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                    {message.content}
-                  </p>
+                  <div className="font-ui text-[13.5px] leading-[1.5] text-[#F4F4F6] break-words [overflow-wrap:anywhere]">
+                    <ReactMarkdown
+                      components={{
+                        p: ({ children }) => (
+                          <p className="mb-2.5 last:mb-0 leading-[1.5]">{children}</p>
+                        ),
+                        strong: ({ children }) => (
+                          <strong className="font-semibold text-white">{children}</strong>
+                        ),
+                        em: ({ children }) => (
+                          <em className="italic text-[#E4E4E7]">{children}</em>
+                        ),
+                        ul: ({ children }) => (
+                          <ul className="my-2 list-disc pl-4 space-y-1">{children}</ul>
+                        ),
+                        ol: ({ children }) => (
+                          <ol className="my-2 list-decimal pl-4 space-y-1">{children}</ol>
+                        ),
+                        li: ({ children }) => (
+                          <li className="leading-relaxed pl-0.5">{children}</li>
+                        ),
+                        code: ({ children }) => (
+                          <code className="rounded bg-[#272A34] px-1 py-0.5 font-mono text-[12px] text-[#E4E4E7]">
+                            {children}
+                          </code>
+                        ),
+                      }}
+                    >
+                      {message.content}
+                    </ReactMarkdown>
+                  </div>
 
                   {/* Rich Cited Book Cards */}
                   {message.books && message.books.length > 0 && (
-                    <div className="flex flex-col gap-2 pt-1 border-t border-[#272A34]/60">
+                    <div className="flex flex-col gap-2 pt-2.5 border-t border-[#272A34]/60">
                       {message.books.map((citedBook) => (
                         <AiCitationCard
                           key={citedBook.id}

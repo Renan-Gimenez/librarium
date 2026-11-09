@@ -101,7 +101,7 @@ export const chatRoutes: FastifyPluginAsyncZod = async (app) => {
                 const dateStr = book.createdAt
                   ? new Date(book.createdAt).toISOString()
                   : null;
-                return `- Título: "${book.title}"\n  Autor: ${book.author}${genres ? `\n  Gêneros: ${genres}` : ""}${dateStr ? `\n  Cadastrado no catálogo em: ${dateStr}` : ""}\n  Sinopse: ${book.description ?? "Sem descrição"}\n  Similaridade semântica: ${(book.similarity * 100).toFixed(1)}%`;
+                return `- Título: "${book.title}"\n  Autor: ${book.author}${genres ? `\n  Gêneros: ${genres}` : ""}\n  Sinopse: ${book.description ?? "Sem descrição"}${dateStr ? `\n  (Metadado interno para consulta de novidades: adicionado em ${dateStr})` : ""}`;
               })
               .join("\n\n")
           : "Nenhum livro relevante encontrado no acervo.";
