@@ -165,24 +165,25 @@ describe("App component integration", () => {
     ).toBeDefined();
   });
 
-  it("toggles the assistant banner when clicking the AI button", async () => {
+  it("toggles the assistant drawer when clicking the AI button", async () => {
     renderWithClient(<App />);
 
     // Wait for content
     await screen.findByRole("heading", { name: "Duna" });
 
-    expect(screen.queryByText(/Assistente IA ativado/i)).toBeNull();
+    expect(screen.queryByText("Assistente Literário")).toBeNull();
 
     const assistantBtn = screen.getByLabelText(
       "Abrir assistente literário com inteligência artificial",
     );
     fireEvent.click(assistantBtn);
 
-    expect(screen.getByText(/Assistente IA ativado/i)).toBeDefined();
+    expect(screen.getByText("Assistente Literário")).toBeDefined();
+    expect(screen.getByText("Consultor do acervo · IA")).toBeDefined();
 
-    const closeBtn = screen.getByRole("button", { name: "Fechar" });
+    const closeBtn = screen.getByRole("button", { name: "Fechar assistente" });
     fireEvent.click(closeBtn);
-    expect(screen.queryByText(/Assistente IA ativado/i)).toBeNull();
+    expect(screen.queryByText("Assistente Literário")).toBeNull();
   });
 
   it("propagates search input and debounces properly", async () => {
@@ -277,16 +278,21 @@ describe("App component integration", () => {
     });
     fireEvent.click(dunaCard);
 
-    expect(await screen.findByRole("dialog")).toBeDefined();
+    expect(
+      (await screen.findAllByRole("heading", { name: "Duna" })).length
+    ).toBeGreaterThan(1);
 
     const askAIBtn = screen.getByRole("button", {
       name: "Perguntar à IA sobre este livro",
     });
     fireEvent.click(askAIBtn);
 
-    // Modal should close and AI banner should be visible
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.getByText(/Assistente IA ativado/i)).toBeDefined();
+    // Chat Drawer should be visible with pre-populated prompt
+    expect(screen.getByText("Assistente Literário")).toBeDefined();
+    const chatInput = screen.getByPlaceholderText(
+      "Pergunte sobre o acervo..."
+    ) as HTMLInputElement;
+    expect(chatInput.value).toContain("Duna");
   });
 
   it("handles sort order and min rating dropdown changes", async () => {
