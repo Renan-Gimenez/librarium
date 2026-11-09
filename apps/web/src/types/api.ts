@@ -60,3 +60,45 @@ export interface BooksQueryParams {
   order?: SortOrder;
 }
 
+export interface CitedBook {
+  id: string;
+  title: string;
+  author: string;
+  description?: string | null;
+  coverUrl?: string | null;
+  rating?: number | null;
+  similarity?: number;
+  genres?: { slug: string; name: string }[];
+  publishedAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt?: string;
+  books?: CitedBook[];
+}
+
+export interface ChatApiRequest {
+  message: string;
+}
+
+export interface ChatApiResponse {
+  data: {
+    userMessage: string;
+    modelReply: string;
+    books?: CitedBook[];
+  };
+  meta: {
+    usage: {
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+    };
+  };
+}
+
+

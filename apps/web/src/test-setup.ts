@@ -13,6 +13,8 @@ Object.assign(globalThis, {
   HTMLElement: window.HTMLElement,
   HTMLInputElement: window.HTMLInputElement,
   HTMLButtonElement: window.HTMLButtonElement,
+  StorageEvent: window.StorageEvent,
+  localStorage: window.localStorage,
   IS_REACT_ACT_ENVIRONMENT: true,
 });
 
@@ -27,6 +29,8 @@ Object.assign(global, {
   HTMLElement: window.HTMLElement,
   HTMLInputElement: window.HTMLInputElement,
   HTMLButtonElement: window.HTMLButtonElement,
+  StorageEvent: window.StorageEvent,
+  localStorage: window.localStorage,
   IS_REACT_ACT_ENVIRONMENT: true,
 });
 

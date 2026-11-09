@@ -165,24 +165,25 @@ describe("App component integration", () => {
     ).toBeDefined();
   });
 
-  it("toggles the assistant banner when clicking the AI button", async () => {
+  it("toggles the assistant drawer when clicking the AI button", async () => {
     renderWithClient(<App />);
 
     // Wait for content
     await screen.findByRole("heading", { name: "Duna" });
 
-    expect(screen.queryByText(/Assistente IA ativado/i)).toBeNull();
+    expect(screen.queryByText("Assistente Literário")).toBeNull();
 
     const assistantBtn = screen.getByLabelText(
       "Abrir assistente literário com inteligência artificial",
     );
     fireEvent.click(assistantBtn);
 
-    expect(screen.getByText(/Assistente IA ativado/i)).toBeDefined();
+    expect(screen.getByText("Assistente Literário")).toBeDefined();
+    expect(screen.getByText("Consultor do acervo · IA")).toBeDefined();
 
-    const closeBtn = screen.getByRole("button", { name: "Fechar" });
+    const closeBtn = screen.getByRole("button", { name: "Fechar assistente" });
     fireEvent.click(closeBtn);
-    expect(screen.queryByText(/Assistente IA ativado/i)).toBeNull();
+    expect(screen.queryByText("Assistente Literário")).toBeNull();
   });
 
   it("propagates search input and debounces properly", async () => {
@@ -277,16 +278,21 @@ describe("App component integration", () => {
     });
     fireEvent.click(dunaCard);
 
-    expect(await screen.findByRole("dialog")).toBeDefined();
+    expect(
+      (await screen.findAllByRole("heading", { name: "Duna" })).length
+    ).toBeGreaterThan(1);
 
     const askAIBtn = screen.getByRole("button", {
       name: "Perguntar à IA sobre este livro",
     });
     fireEvent.click(askAIBtn);
 
-    // Modal should close and AI banner should be visible
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.getByText(/Assistente IA ativado/i)).toBeDefined();
+    // Chat Drawer should be visible with pre-populated prompt
+    expect(screen.getByText("Assistente Literário")).toBeDefined();
+    const chatInput = screen.getByPlaceholderText(
+      "Pergunte sobre o acervo..."
+    ) as HTMLInputElement;
+    expect(chatInput.value).toContain("Duna");
   });
 
   it("handles sort order and min rating dropdown changes", async () => {
@@ -375,5 +381,79 @@ describe("App component integration", () => {
       });
     });
     expect(screen.queryByRole("button", { name: "Ir para a página 3" })).toBeNull();
+  });
+
+  it("opens book details modal from AI citation card while keeping assistant drawer open, and closing modal preserves drawer", async () => {
+    const chatService = await import("@/services/chat");
+    const sendSpy = spyOn(chatService, "sendChatMessage").mockResolvedValueOnce({
+      data: {
+        userMessage: "Recomende Duna",
+        modelReply: "Duna é fantástico.",
+        books: [
+          {
+            id: "cited-dune-id",
+            title: "Duna Citação",
+            author: "Frank Herbert",
+            description: "Sinopse completa de Duna.",
+            coverUrl: "https://example.com/dune.jpg",
+            rating: 4.9,
+            similarity: 98,
+            genres: [{ slug: "sci-fi", name: "Ficção Científica" }],
+          },
+        ],
+      },
+      meta: {
+        usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+      },
+    });
+
+    renderWithClient(<App />);
+
+    // Open assistant drawer
+    const aiBtn = screen.getByRole("button", {
+      name: /Abrir assistente literário/i,
+    });
+    fireEvent.click(aiBtn);
+
+    expect(screen.getByText("Assistente Literário")).toBeDefined();
+
+    // Send a message
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Recomende Duna" } });
+    const sendBtn = screen.getByRole("button", { name: "Enviar mensagem" });
+    fireEvent.click(sendBtn);
+
+    // Wait for citation card
+    const citationBtn = await screen.findByRole("button", {
+      name: "Ver detalhes do livro Duna Citação",
+    });
+    expect(citationBtn).toBeDefined();
+
+    // Click citation card
+    fireEvent.click(citationBtn);
+
+    // Book details modal should open on top
+    const modalHeading = await screen.findByRole("heading", {
+      name: "Duna Citação",
+    });
+    expect(modalHeading).toBeDefined();
+    expect(screen.getByText("Sinopse completa de Duna.")).toBeDefined();
+
+    // Assistant drawer is STILL open in the background
+    expect(screen.getByText("Assistente Literário")).toBeDefined();
+
+    // Close modal via Close button
+    const closeButtons = screen.getAllByRole("button", {
+      name: "Fechar",
+    });
+    fireEvent.click(closeButtons[0]);
+
+    // Modal is gone, but drawer remains open
+    await waitFor(() => {
+      expect(screen.queryByText("Sinopse completa de Duna.")).toBeNull();
+    });
+    expect(screen.getByText("Assistente Literário")).toBeDefined();
+
+    sendSpy.mockRestore();
   });
 });

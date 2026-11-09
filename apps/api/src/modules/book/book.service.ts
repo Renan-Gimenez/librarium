@@ -377,6 +377,9 @@ type SimilarBook = {
   title: string;
   author: string;
   description: string | null;
+  coverUrl: string | null;
+  rating: number | null;
+  publishedAt: Date | null;
   genres: { slug: string; name: string }[];
   createdAt: Date;
   similarity: number;
@@ -394,6 +397,9 @@ export async function findSimilarBooks(
       b."title",
       b."author",
       b."description",
+      b."coverUrl",
+      b."rating",
+      b."publishedAt",
       b."createdAt",
       COALESCE(
         json_agg(

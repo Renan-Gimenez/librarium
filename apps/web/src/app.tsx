@@ -4,6 +4,7 @@ import { FilterBar } from "./components/filter-bar";
 import { BookGrid } from "./components/book-grid";
 import { Pagination } from "./components/pagination";
 import { BookDetailsModal } from "./components/book-details-modal";
+import { ChatDrawer } from "./components/chat-drawer";
 import { useDebounce } from "./hooks/use-debounce";
 import { useBooks, useGenres } from "./hooks/use-books";
 import type { Book, BookSortBy, SortOrder } from "./types/api";
@@ -14,6 +15,7 @@ export function App() {
   const [search, setSearch] = React.useState("");
   const debouncedSearch = useDebounce(search, 300);
   const [isAssistantOpen, setIsAssistantOpen] = React.useState(false);
+  const [chatInitialPrompt, setChatInitialPrompt] = React.useState<string>("");
   const [selectedBook, setSelectedBook] = React.useState<Book | null>(null);
 
   // Filter States
@@ -129,22 +131,6 @@ export function App() {
           totalBooks={totalBooks}
         />
 
-        {isAssistantOpen && (
-          <div
-            role="status"
-            className="flex items-center justify-between rounded-[10px] border border-[#7C3AED]/40 bg-[#241C3E]/80 px-4 py-2.5 text-xs font-medium text-[#C4B5FD] backdrop-blur-xs"
-          >
-            <span>✨ Assistente IA ativado (painel lateral interativo no Epic 3).</span>
-            <button
-              type="button"
-              onClick={() => setIsAssistantOpen(false)}
-              className="text-[#C4B5FD]/70 hover:text-white"
-            >
-              Fechar
-            </button>
-          </div>
-        )}
-
         <BookGrid
           books={books}
           isLoading={isLoadingBooks}
@@ -174,9 +160,18 @@ export function App() {
           onClose={() => setSelectedBook(null)}
           onAskAI={(book) => {
             setSelectedBook(null);
+            setChatInitialPrompt(
+              `Me fale mais sobre a obra "${book.title}", de ${book.author || "autor desconhecido"}.`
+            );
             setIsAssistantOpen(true);
-            console.info("Ask AI about:", book.title);
           }}
+        />
+
+        <ChatDrawer
+          isOpen={isAssistantOpen}
+          onClose={() => setIsAssistantOpen(false)}
+          initialPrompt={chatInitialPrompt}
+          onSelectBook={handleSelectBook}
         />
       </main>
     </div>
