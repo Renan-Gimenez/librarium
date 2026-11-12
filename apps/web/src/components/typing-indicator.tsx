@@ -11,7 +11,7 @@ export function TypingIndicator({
     <div
       role="status"
       aria-live="polite"
-      className={`inline-flex items-center gap-2 rounded-[12px] border border-[#272A34] bg-[#14161B] px-3.5 py-2.5 text-[#A1A1AA] ${className}`}
+      className={`inline-flex items-center rounded-[12px] border border-[#272A34] bg-[#14161B] px-3.5 py-3 text-[#A1A1AA] ${className}`}
     >
       <div className="flex items-center gap-1.5" aria-hidden="true">
         <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#A1A1AA]" />
@@ -24,9 +24,7 @@ export function TypingIndicator({
           style={{ animationDelay: "300ms" }}
         />
       </div>
-      <span className="font-ui text-[12px] leading-none text-[#A1A1AA]">
-        {label}
-      </span>
+      <span className="sr-only">{label}</span>
     </div>
   );
 }

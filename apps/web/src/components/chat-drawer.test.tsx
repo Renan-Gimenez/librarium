@@ -336,4 +336,53 @@ describe("ChatDrawer Component", () => {
     ) as HTMLInputElement;
     expect(input.value).toBe("Conte mais sobre o livro Neuromancer");
   });
+
+  it("keeps input enabled while loading, blocks Enter submit, and cancels request via stop button with feedback", async () => {
+    const sendSpy = spyOn(chatService, "sendChatMessage").mockImplementation(
+      (_params, options) =>
+        new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        })
+    );
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText(
+      "Pergunte sobre o acervo..."
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Livros de terror" } });
+
+    const sendBtn = screen.getByRole("button", { name: "Enviar mensagem" });
+    fireEvent.click(sendBtn);
+
+    // Input stays enabled so user can compose next message while waiting
+    expect(input.disabled).toBe(false);
+    expect(
+      screen.getByPlaceholderText("Pergunte sobre o acervo...")
+    ).toBeDefined();
+
+    // Pressing Enter while loading should not dispatch a second request
+    fireEvent.change(input, { target: { value: "Próxima pergunta" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+
+    // Stop button replaces send button and aborts request with user feedback
+    const stopBtn = screen.getByRole("button", {
+      name: "Interromper resposta",
+    });
+    fireEvent.click(stopBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText("Solicitação encerrada.")).toBeDefined();
+    });
+
+    // No error alert should be displayed and input preserves typed draft
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(input.value).toBe("Próxima pergunta");
+
+    sendSpy.mockRestore();
+  });
 });

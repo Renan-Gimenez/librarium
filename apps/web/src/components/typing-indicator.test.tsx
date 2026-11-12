@@ -4,13 +4,15 @@ import { render, screen } from "@testing-library/react";
 import { TypingIndicator } from "./typing-indicator";
 
 describe("TypingIndicator Component", () => {
-  it("renders with default label and accessibility attributes", () => {
+  it("renders with default sr-only label and accessibility attributes", () => {
     render(<TypingIndicator />);
 
     const statusEl = screen.getByRole("status");
     expect(statusEl).toBeDefined();
     expect(statusEl.getAttribute("aria-live")).toBe("polite");
-    expect(screen.getByText("gerando resposta...")).toBeDefined();
+    const labelEl = screen.getByText("gerando resposta...");
+    expect(labelEl).toBeDefined();
+    expect(labelEl.className).toContain("sr-only");
   });
 
   it("renders with custom label if provided", () => {

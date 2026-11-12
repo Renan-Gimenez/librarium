@@ -1,7 +1,7 @@
 import * as React from "react";
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
-import { ArrowUp, Sparkles, X } from "lucide-react";
+import { ArrowUp, Sparkles, Square, X } from "lucide-react";
 import {
   Sheet,
   SheetContent,
@@ -57,6 +57,7 @@ export function ChatDrawer({
   const inputRef = React.useRef<HTMLInputElement>(null);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const abortControllerRef = React.useRef<AbortController | null>(null);
+  const cancelledByUserRef = React.useRef(false);
 
   // Sync state with prop change without setState in useEffect
   if (initialPrompt !== prevPrompt) {
@@ -86,12 +87,20 @@ export function ChatDrawer({
   // Abort pending request when drawer closes or unmounts
   React.useEffect(() => {
     if (!isOpen) {
+      cancelledByUserRef.current = false;
       abortControllerRef.current?.abort();
     }
     return () => {
+      cancelledByUserRef.current = false;
       abortControllerRef.current?.abort();
     };
   }, [isOpen]);
+
+  const handleStopGeneration = () => {
+    if (!isLoading) return;
+    cancelledByUserRef.current = true;
+    abortControllerRef.current?.abort();
+  };
 
   const handleStarterClick = (starter: string) => {
     setInputValue(starter);
@@ -120,6 +129,7 @@ export function ChatDrawer({
 
     setIsLoading(true);
 
+    cancelledByUserRef.current = false;
     abortControllerRef.current?.abort();
     abortControllerRef.current = new AbortController();
 
@@ -147,7 +157,23 @@ export function ChatDrawer({
       setMessages((prev) => [...prev, assistantMessage]);
       touchSession();
     } catch (err: unknown) {
-      if (axios.isCancel(err)) {
+      if (
+        axios.isCancel(err) ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
+        if (cancelledByUserRef.current) {
+          cancelledByUserRef.current = false;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `cancelled-${Date.now()}`,
+              role: "assistant",
+              content: "Solicitação encerrada.",
+              isCancelled: true,
+              createdAt: new Date().toISOString(),
+            },
+          ]);
+        }
         return;
       }
       setError(extractErrorMessage(err));
@@ -259,6 +285,19 @@ export function ChatDrawer({
               );
             }
 
+            if (message.isCancelled) {
+              return (
+                <div key={message.id} className="flex items-center gap-2.5">
+                  <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] border border-[#272A34] bg-[#14161B] text-[#A1A1AA]">
+                    <Square className="h-[10px] w-[10px]" aria-hidden="true" />
+                  </div>
+                  <p className="font-ui text-[12.5px] italic text-[#A1A1AA]">
+                    {message.content}
+                  </p>
+                </div>
+              );
+            }
+
             return (
               <div key={message.id} className="flex items-start gap-2.5">
                 <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#7C3AED] text-white mt-0.5">
@@ -364,19 +403,29 @@ export function ChatDrawer({
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={isLoading}
               aria-label="Mensagem para o assistente literário"
-              placeholder={isLoading ? "Aguarde a resposta..." : "Pergunte sobre o acervo..."}
-              className="flex-1 rounded-[12px] border border-[#272A34] bg-[#0C0D10] px-3.5 py-2.5 text-[13.5px] text-[#F4F4F6] placeholder:text-[#71717A] dark:placeholder:text-[#A1A1AA] outline-none transition-colors focus:border-[#7C3AED] focus:ring-1 focus:ring-[#7C3AED] disabled:opacity-50"
+              placeholder="Pergunte sobre o acervo..."
+              className="flex-1 rounded-[12px] border border-[#272A34] bg-[#0C0D10] px-3.5 py-2.5 text-[13.5px] text-[#F4F4F6] placeholder:text-[#71717A] dark:placeholder:text-[#A1A1AA] outline-none transition-colors focus:border-[#7C3AED] focus:ring-1 focus:ring-[#7C3AED]"
             />
-            <button
-              type="submit"
-              disabled={!inputValue.trim() || isLoading}
-              aria-label="Enviar mensagem"
-              className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-[10px] bg-[#7C3AED] text-white transition-colors hover:bg-[#6D28D9] disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
-            >
-              <ArrowUp className="h-4 w-4 stroke-[2.5]" aria-hidden="true" />
-            </button>
+            {isLoading ? (
+              <button
+                type="button"
+                onClick={handleStopGeneration}
+                aria-label="Interromper resposta"
+                className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-[10px] bg-[#272A34] text-[#F4F4F6] transition-colors hover:bg-[#3A3E4A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
+              >
+                <Square className="h-3.5 w-3.5 fill-current" aria-hidden="true" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!inputValue.trim()}
+                aria-label="Enviar mensagem"
+                className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-[10px] bg-[#7C3AED] text-white transition-colors hover:bg-[#6D28D9] disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
+              >
+                <ArrowUp className="h-4 w-4 stroke-[2.5]" aria-hidden="true" />
+              </button>
+            )}
           </form>
 
           <p className="text-center font-ui text-[10px] text-[#A1A1AA]">
