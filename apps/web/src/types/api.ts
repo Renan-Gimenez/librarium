@@ -80,6 +80,7 @@ export interface ChatMessage {
   content: string;
   createdAt?: string;
   books?: CitedBook[];
+  isCancelled?: boolean;
 }
 
 export interface ChatApiRequest {
