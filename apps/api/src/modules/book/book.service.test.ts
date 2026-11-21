@@ -7,8 +7,11 @@ import {
   buildPrefixTsQuery,
   createBook,
   findSimilarBooks,
+  findSimilarBooksByBookId,
+  getCatalogStats,
   listBooks,
   listBooksQuerySchema,
+  parsePublishedDateBoundary,
   searchSimilarBooks,
   updateBook,
   type CreateBookTx,
@@ -513,6 +516,274 @@ describe("book.service", () => {
 
       expect(capturedQueries[0]?.sql).toContain(
         `ORDER BY "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+      );
+    });
+
+    it("validates publishedAfter/publishedBefore dates, prevents calendar rollover, rejects inverted intervals, and preserves ISO timestamps", () => {
+      expect(
+        parsePublishedDateBoundary("1960-01-01", "start")?.toISOString(),
+      ).toBe("1960-01-01T00:00:00.000Z");
+      expect(
+        parsePublishedDateBoundary("1969-12-31", "end")?.toISOString(),
+      ).toBe("1969-12-31T23:59:59.999Z");
+      expect(
+        parsePublishedDateBoundary(
+          "1965-08-01T14:30:00.000Z",
+          "end",
+        )?.toISOString(),
+      ).toBe("1965-08-01T14:30:00.000Z");
+      expect(
+        parsePublishedDateBoundary(
+          "1965-08-01T12:00:00-03:00",
+          "start",
+        )?.toISOString(),
+      ).toBe("1965-08-01T15:00:00.000Z");
+
+      // Calendar rollover, year < 1, and invalid formats
+      expect(parsePublishedDateBoundary("2020-02-31", "start")).toBeNull();
+      expect(parsePublishedDateBoundary("2021-02-29", "start")).toBeNull();
+      expect(parsePublishedDateBoundary("2020-04-31", "end")).toBeNull();
+      expect(
+        parsePublishedDateBoundary("2020-02-31T00:00:00Z", "start"),
+      ).toBeNull();
+      expect(parsePublishedDateBoundary("0000-01-01", "start")).toBeNull();
+      expect(parsePublishedDateBoundary("0000-02-29", "end")).toBeNull();
+      expect(
+        parsePublishedDateBoundary("0001-01-01T00:00:00+05:00", "start"),
+      ).toBeNull();
+      expect(parsePublishedDateBoundary("abc", "start")).toBeNull();
+
+      // Early CE dates (year 0001..0099) must not map to 1900..1999
+      const leap96 = parsePublishedDateBoundary("0096-02-29", "start");
+      expect(leap96?.getUTCFullYear()).toBe(96);
+      expect(leap96?.getUTCMonth()).toBe(1);
+      expect(leap96?.getUTCDate()).toBe(29);
+      expect(parsePublishedDateBoundary("0095-02-29", "start")).toBeNull();
+
+      // Same-day YYYY-MM-DD range is inclusive and valid
+      expect(
+        listBooksQuerySchema.parse({
+          publishedAfter: "2020-02-29",
+          publishedBefore: "2020-02-29",
+        }),
+      ).toMatchObject({
+        publishedAfter: "2020-02-29",
+        publishedBefore: "2020-02-29",
+      });
+
+      // Invalid dates, year 0000, UTC rollover < 1, and inverted ranges rejected by Zod
+      expect(() =>
+        listBooksQuerySchema.parse({ publishedAfter: "2020-02-31" }),
+      ).toThrow();
+      expect(() =>
+        listBooksQuerySchema.parse({ publishedAfter: "0000-01-01" }),
+      ).toThrow();
+      expect(() =>
+        listBooksQuerySchema.parse({
+          publishedAfter: "0001-01-01T00:00:00+05:00",
+        }),
+      ).toThrow();
+      expect(() =>
+        listBooksQuerySchema.parse({ publishedBefore: "abc" }),
+      ).toThrow();
+      expect(() =>
+        listBooksQuerySchema.parse({
+          publishedAfter: "2020-01-01",
+          publishedBefore: "2010-01-01",
+        }),
+      ).toThrow();
+      expect(() =>
+        listBooksQuerySchema.parse({
+          publishedAfter: "2020-01-01T12:00:00Z",
+          publishedBefore: "2020-01-01T11:59:59Z",
+        }),
+      ).toThrow();
+    });
+
+    it("applies inclusive single-bound and double-bound publishedAfter/publishedBefore filters in Prisma path", async () => {
+      const findManyMock = mock(async () => [makeBook()]);
+      const countMock = mock(async () => 1);
+
+      await listBooks(
+        {
+          publishedAfter: "1960-01-01",
+          publishedBefore: "1969-12-31",
+          page: 1,
+          limit: 10,
+          order: "desc",
+        },
+        {
+          prisma: {
+            book: { findMany: findManyMock, count: countMock },
+          },
+        },
+      );
+
+      const bothArgs = (findManyMock.mock.calls[0] as unknown[])[0] as {
+        where: { AND: unknown[] };
+      };
+      expect(bothArgs.where).toEqual({
+        AND: [
+          {
+            publishedAt: {
+              gte: new Date("1960-01-01T00:00:00.000Z"),
+              lte: new Date("1969-12-31T23:59:59.999Z"),
+            },
+          },
+        ],
+      });
+      expect(countMock).toHaveBeenCalledWith({ where: bothArgs.where });
+
+      await listBooks(
+        {
+          publishedAfter: "1980-01-01",
+          page: 1,
+          limit: 10,
+          order: "desc",
+        },
+        {
+          prisma: {
+            book: { findMany: findManyMock, count: countMock },
+          },
+        },
+      );
+
+      const afterOnlyArgs = (findManyMock.mock.calls[1] as unknown[])[0] as {
+        where: { AND: unknown[] };
+      };
+      expect(afterOnlyArgs.where).toEqual({
+        AND: [
+          {
+            publishedAt: {
+              gte: new Date("1980-01-01T00:00:00.000Z"),
+            },
+          },
+        ],
+      });
+
+      await listBooks(
+        {
+          publishedBefore: "1999-12-31",
+          page: 1,
+          limit: 10,
+          order: "desc",
+        },
+        {
+          prisma: {
+            book: { findMany: findManyMock, count: countMock },
+          },
+        },
+      );
+
+      const beforeOnlyArgs = (findManyMock.mock.calls[2] as unknown[])[0] as {
+        where: { AND: unknown[] };
+      };
+      expect(beforeOnlyArgs.where).toEqual({
+        AND: [
+          {
+            publishedAt: {
+              lte: new Date("1999-12-31T23:59:59.999Z"),
+            },
+          },
+        ],
+      });
+    });
+
+    it("applies inclusive single-bound and double-bound publishedAfter/publishedBefore filters in FTS path for both data and COUNT(*)", async () => {
+      const capturedQueries: { sql: string; values: unknown[] }[] = [];
+
+      const queryRawMock = mock(
+        async (query: TemplateStringsArray | Prisma.Sql) => {
+          const sqlObj = query as Prisma.Sql;
+          capturedQueries.push({
+            sql: sqlObj.sql,
+            values: [...sqlObj.values],
+          });
+          if (sqlObj.sql.includes("COUNT(*)")) {
+            return [{ total: 1 }];
+          }
+          return [];
+        },
+      );
+
+      const ftsPrisma = {
+        $queryRaw: <T = unknown>(query: TemplateStringsArray | Prisma.Sql) =>
+          queryRawMock(query) as Promise<T>,
+      };
+
+      await listBooks(
+        {
+          search: "duna",
+          publishedAfter: "1960-01-01",
+          publishedBefore: "1969-12-31T15:30:00.000Z",
+          page: 1,
+          limit: 5,
+          order: "desc",
+        },
+        { prisma: ftsPrisma },
+      );
+
+      const dataQuery = capturedQueries[0]!;
+      const countQuery = capturedQueries[1]!;
+
+      expect(dataQuery.sql).toContain('b."publishedAt" >= ?');
+      expect(dataQuery.sql).toContain('b."publishedAt" <= ?');
+      expect(dataQuery.values).toContainEqual(
+        new Date("1960-01-01T00:00:00.000Z"),
+      );
+      expect(dataQuery.values).toContainEqual(
+        new Date("1969-12-31T15:30:00.000Z"),
+      );
+
+      expect(countQuery.sql).toContain('b."publishedAt" >= ?');
+      expect(countQuery.sql).toContain('b."publishedAt" <= ?');
+      expect(countQuery.values).toContainEqual(
+        new Date("1960-01-01T00:00:00.000Z"),
+      );
+      expect(countQuery.values).toContainEqual(
+        new Date("1969-12-31T15:30:00.000Z"),
+      );
+
+      capturedQueries.length = 0;
+
+      await listBooks(
+        {
+          search: "duna",
+          publishedAfter: "1980-01-01",
+          page: 1,
+          limit: 5,
+          order: "desc",
+        },
+        { prisma: ftsPrisma },
+      );
+
+      expect(capturedQueries[0]?.sql).toContain('b."publishedAt" >= ?');
+      expect(capturedQueries[0]?.sql).not.toContain('b."publishedAt" <= ?');
+      expect(capturedQueries[1]?.sql).toContain('b."publishedAt" >= ?');
+      expect(capturedQueries[1]?.sql).not.toContain('b."publishedAt" <= ?');
+      expect(capturedQueries[1]?.values).toContainEqual(
+        new Date("1980-01-01T00:00:00.000Z"),
+      );
+
+      capturedQueries.length = 0;
+
+      await listBooks(
+        {
+          search: "duna",
+          publishedBefore: "1999-12-31",
+          page: 1,
+          limit: 5,
+          order: "desc",
+        },
+        { prisma: ftsPrisma },
+      );
+
+      expect(capturedQueries[0]?.sql).not.toContain('b."publishedAt" >= ?');
+      expect(capturedQueries[0]?.sql).toContain('b."publishedAt" <= ?');
+      expect(capturedQueries[1]?.sql).not.toContain('b."publishedAt" >= ?');
+      expect(capturedQueries[1]?.sql).toContain('b."publishedAt" <= ?');
+      expect(capturedQueries[1]?.values).toContainEqual(
+        new Date("1999-12-31T23:59:59.999Z"),
       );
     });
   });
@@ -1478,6 +1749,409 @@ describe("book.service", () => {
       ).rejects.toThrow(RangeError);
 
       expect(genEmbeddingMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("getCatalogStats", () => {
+    it("computes real catalog aggregations via PostgreSQL aggregate and genre counts without loading books", async () => {
+      const oldest = new Date("1949-06-08T00:00:00.000Z");
+      const newest = new Date("2024-03-15T00:00:00.000Z");
+
+      const aggregateMock = mock(async () => ({
+        _count: { _all: 42 },
+        _avg: { rating: 4.65 },
+        _min: { publishedAt: oldest },
+        _max: { publishedAt: newest },
+      }));
+      const genreFindManyMock = mock(async () => [
+        { slug: "ficcao-cientifica", name: "Ficção Científica", _count: { books: 18 } },
+        { slug: "fantasia", name: "Fantasia", _count: { books: 12 } },
+      ]);
+
+      const stats = await getCatalogStats({
+        prisma: {
+          book: { aggregate: aggregateMock },
+          genre: { findMany: genreFindManyMock },
+        },
+      });
+
+      expect(aggregateMock).toHaveBeenCalledWith({
+        _count: { _all: true },
+        _avg: { rating: true },
+        _min: { publishedAt: true },
+        _max: { publishedAt: true },
+      });
+      expect(genreFindManyMock).toHaveBeenCalledWith({
+        select: {
+          slug: true,
+          name: true,
+          _count: { select: { books: true } },
+        },
+        orderBy: [{ books: { _count: "desc" } }, { name: "asc" }],
+      });
+      expect(stats).toEqual({
+        totalBooks: 42,
+        averageRating: 4.65,
+        booksByGenre: [
+          { slug: "ficcao-cientifica", name: "Ficção Científica", count: 18 },
+          { slug: "fantasia", name: "Fantasia", count: 12 },
+        ],
+        oldestPublishedAt: oldest,
+        newestPublishedAt: newest,
+      });
+    });
+
+    it("handles empty catalog gracefully while preserving zero-count genres", async () => {
+      const stats = await getCatalogStats({
+        prisma: {
+          book: {
+            aggregate: mock(async () => ({
+              _count: { _all: 0 },
+              _avg: { rating: null },
+              _min: { publishedAt: null },
+              _max: { publishedAt: null },
+            })),
+          },
+          genre: {
+            findMany: mock(async () => [
+              { slug: "ficcao", name: "Ficção", _count: { books: 0 } },
+            ]),
+          },
+        },
+      });
+
+      expect(stats).toEqual({
+        totalBooks: 0,
+        averageRating: null,
+        booksByGenre: [{ slug: "ficcao", name: "Ficção", count: 0 }],
+        oldestPublishedAt: null,
+        newestPublishedAt: null,
+      });
+    });
+
+    it("preserves averageRating of 0, handles empty genres list, and converts ISO string _min/_max dates", async () => {
+      const stats = await getCatalogStats({
+        prisma: {
+          book: {
+            aggregate: mock(async () => ({
+              _count: { _all: 2 },
+              _avg: { rating: 0 },
+              _min: { publishedAt: "1984-01-01T00:00:00.000Z" },
+              _max: { publishedAt: "2020-05-10T00:00:00.000Z" },
+            })),
+          },
+          genre: {
+            findMany: mock(async () => []),
+          },
+        },
+      });
+
+      expect(stats).toEqual({
+        totalBooks: 2,
+        averageRating: 0,
+        booksByGenre: [],
+        oldestPublishedAt: new Date("1984-01-01T00:00:00.000Z"),
+        newestPublishedAt: new Date("2020-05-10T00:00:00.000Z"),
+      });
+    });
+  });
+
+  describe("findSimilarBooksByBookId", () => {
+    it("reuses persisted pgvector embedding via O(1) lookup + HNSW top-K CTE excluding own bookId and applies minSimilarity post-CTE", async () => {
+      const capturedQueries: {
+        sql: string;
+        values: unknown[];
+        contextTag?: string;
+      }[] = [];
+
+      const highMatch = makeSimilarBook({ id: "book-2", similarity: 0.84 });
+      const boundaryMatch = makeSimilarBook({ id: "book-3", similarity: 0.25 });
+      const belowThreshold = makeSimilarBook({ id: "book-4", similarity: 0.24 });
+
+      const fakePrisma = {
+        contextTag: "similar-by-id",
+        async $queryRaw<T = unknown>(
+          this: { contextTag?: string },
+          strings: TemplateStringsArray,
+          ...values: unknown[]
+        ): Promise<T> {
+          const sql = strings.join("?");
+          capturedQueries.push({
+            sql,
+            values,
+            contextTag: this?.contextTag,
+          });
+
+          if (capturedQueries.length === 1) {
+            return [
+              {
+                id: "book-1",
+                title: "Duna",
+                author: "Frank Herbert",
+                embeddingText: "[0.1,0.2,0.3]",
+              },
+            ] as T;
+          }
+
+          return [highMatch, boundaryMatch, belowThreshold] as T;
+        },
+      };
+
+      const result = await findSimilarBooksByBookId("book-1", 3, undefined, {
+        prisma: fakePrisma,
+      });
+
+      expect(capturedQueries).toHaveLength(2);
+      expect(capturedQueries[0]?.contextTag).toBe("similar-by-id");
+      expect(capturedQueries[1]?.contextTag).toBe("similar-by-id");
+
+      expect(capturedQueries[0]?.sql).toContain('"embedding"::text AS "embeddingText"');
+      expect(capturedQueries[0]?.values).toEqual(["book-1"]);
+
+      const vectorSql = capturedQueries[1]!.sql;
+      const cteIndex = vectorSql.indexOf("WITH top_books AS");
+      const joinIndex = vectorSql.indexOf('LEFT JOIN "_BookToGenre"');
+      expect(cteIndex).toBeGreaterThanOrEqual(0);
+      expect(joinIndex).toBeGreaterThan(cteIndex);
+      expect(vectorSql.slice(cteIndex, joinIndex)).toContain(
+        'WHERE b."embedding" IS NOT NULL',
+      );
+      expect(vectorSql.slice(cteIndex, joinIndex)).toContain('b."id" <> ?');
+      expect(vectorSql.slice(cteIndex, joinIndex)).toContain(
+        'ORDER BY b."embedding" <=> ?::vector',
+      );
+      expect(vectorSql.slice(cteIndex, joinIndex)).toContain("LIMIT ?");
+      expect(vectorSql.slice(joinIndex)).toContain(
+        'ORDER BY tb."similarity" DESC, tb."createdAt" DESC, tb."id" ASC',
+      );
+      expect(capturedQueries[1]?.values).toEqual([
+        "[0.1,0.2,0.3]",
+        "book-1",
+        "[0.1,0.2,0.3]",
+        3,
+      ]);
+
+      expect(result).toEqual({
+        status: "ok",
+        sourceBook: { id: "book-1", title: "Duna", author: "Frank Herbert" },
+        books: [highMatch, boundaryMatch],
+      });
+    });
+
+    it("hydrates raw similar rows safely (null rating, string dates, malformed/non-array genres) and returns empty books when all are below minSimilarity", async () => {
+      let callCount = 0;
+      const queryRawMock = mock(
+        async (_query: TemplateStringsArray, ..._values: unknown[]) => {
+          callCount += 1;
+          if (callCount % 2 === 1) {
+            return [
+              {
+                id: "book-src",
+                title: "Duna",
+                author: "Frank Herbert",
+                embeddingText: "[0.1,0.2]",
+              },
+            ];
+          }
+          if (callCount === 2) {
+            return [
+              {
+                id: "sim-1",
+                title: "Livro Null Rating",
+                author: "Autor A",
+                description: null,
+                coverUrl: null,
+                rating: null,
+                publishedAt: null,
+                createdAt: "2026-01-01T00:00:00.000Z",
+                genres: JSON.stringify([{ slug: "ficcao", name: "Ficção" }]),
+                similarity: 0.72,
+              },
+              {
+                id: "sim-2",
+                title: "Livro Genres Quebrado",
+                author: "Autor B",
+                description: "Desc",
+                coverUrl: null,
+                rating: Number.NaN,
+                publishedAt: "1999-05-01T00:00:00.000Z",
+                createdAt: "2026-02-01T00:00:00.000Z",
+                genres: "{bad-json",
+                similarity: 0.5,
+              },
+              {
+                id: "sim-3",
+                title: "Livro Genres Objeto",
+                author: "Autor C",
+                description: null,
+                coverUrl: null,
+                rating: 4.1,
+                publishedAt: null,
+                createdAt: "2026-03-01T00:00:00.000Z",
+                genres: '{"slug":"x"}',
+                similarity: 0.3,
+              },
+              {
+                id: "sim-4",
+                title: "Livro Genres Null",
+                author: "Autor D",
+                description: null,
+                coverUrl: null,
+                rating: 3.5,
+                publishedAt: null,
+                createdAt: "2026-04-01T00:00:00.000Z",
+                genres: null,
+                similarity: 0.28,
+              },
+            ];
+          }
+          return [
+            {
+              id: "below-1",
+              title: "Distante",
+              author: "Autor",
+              description: null,
+              coverUrl: null,
+              rating: 4.0,
+              publishedAt: null,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              genres: [],
+              similarity: 0.24,
+            },
+          ];
+        },
+      );
+
+      const hydratedRes = await findSimilarBooksByBookId("book-src", 5, 0.25, {
+        prisma: {
+          $queryRaw: <T = unknown>(
+            query: TemplateStringsArray,
+            ...values: unknown[]
+          ) => queryRawMock(query, ...values) as Promise<T>,
+        },
+      });
+
+      expect(hydratedRes.status).toBe("ok");
+      if (hydratedRes.status === "ok") {
+        expect(hydratedRes.books).toHaveLength(4);
+        expect(hydratedRes.books[0]?.rating).toBeNull();
+        expect(hydratedRes.books[0]?.publishedAt).toBeNull();
+        expect(hydratedRes.books[0]?.createdAt).toBeInstanceOf(Date);
+        expect(hydratedRes.books[0]?.genres).toEqual([
+          { slug: "ficcao", name: "Ficção" },
+        ]);
+        expect(hydratedRes.books[1]?.rating).toBeNull();
+        expect(hydratedRes.books[1]?.publishedAt).toBeInstanceOf(Date);
+        expect(hydratedRes.books[1]?.genres).toEqual([]);
+        expect(hydratedRes.books[2]?.genres).toEqual([]);
+        expect(hydratedRes.books[3]?.genres).toEqual([]);
+      }
+
+      const emptyBelowRes = await findSimilarBooksByBookId(
+        "book-src",
+        5,
+        0.25,
+        {
+          prisma: {
+            $queryRaw: <T = unknown>(
+              query: TemplateStringsArray,
+              ...values: unknown[]
+            ) => queryRawMock(query, ...values) as Promise<T>,
+          },
+        },
+      );
+      expect(emptyBelowRes).toEqual({
+        status: "ok",
+        sourceBook: { id: "book-src", title: "Duna", author: "Frank Herbert" },
+        books: [],
+      });
+    });
+
+    it("returns not_found when book does not exist or bookId is blank", async () => {
+      const queryRawMock = mock(
+        async (_query: TemplateStringsArray, ..._values: unknown[]) => [],
+      );
+
+      const blankRes = await findSimilarBooksByBookId("   ", 5, 0.25, {
+        prisma: {
+          $queryRaw: <T = unknown>(
+            query: TemplateStringsArray,
+            ...values: unknown[]
+          ) => queryRawMock(query, ...values) as Promise<T>,
+        },
+      });
+      expect(blankRes).toEqual({ status: "not_found" });
+      expect(queryRawMock).not.toHaveBeenCalled();
+
+      const missingRes = await findSimilarBooksByBookId("missing-id", 5, 0.25, {
+        prisma: {
+          $queryRaw: <T = unknown>(
+            query: TemplateStringsArray,
+            ...values: unknown[]
+          ) => queryRawMock(query, ...values) as Promise<T>,
+        },
+      });
+      expect(missingRes).toEqual({ status: "not_found" });
+      expect(queryRawMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns no_embedding when book exists with null embedding without executing vector query", async () => {
+      const queryRawMock = mock(
+        async (_query: TemplateStringsArray, ..._values: unknown[]) => [
+          {
+            id: "book-no-vec",
+            title: "Sem Vetor",
+            author: "Autor",
+            embeddingText: null,
+          },
+        ],
+      );
+
+      const result = await findSimilarBooksByBookId("book-no-vec", 5, 0.25, {
+        prisma: {
+          $queryRaw: <T = unknown>(
+            query: TemplateStringsArray,
+            ...values: unknown[]
+          ) => queryRawMock(query, ...values) as Promise<T>,
+        },
+      });
+
+      expect(result).toEqual({
+        status: "no_embedding",
+        sourceBook: { id: "book-no-vec", title: "Sem Vetor", author: "Autor" },
+      });
+      expect(queryRawMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("throws RangeError for invalid limit or minSimilarity without querying database", async () => {
+      const queryRawMock = mock(
+        async (_query: TemplateStringsArray, ..._values: unknown[]) => [],
+      );
+
+      for (const badLimit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        await expect(
+          findSimilarBooksByBookId("book-1", badLimit, 0.25, {
+            prisma: {
+              $queryRaw: <T = unknown>(
+                query: TemplateStringsArray,
+                ...values: unknown[]
+              ) => queryRawMock(query, ...values) as Promise<T>,
+            },
+          }),
+        ).rejects.toThrow(RangeError);
+      }
+
+      await expect(
+        findSimilarBooksByBookId("book-1", 5, 1.5, {
+          prisma: {
+            $queryRaw: <T = unknown>(
+              query: TemplateStringsArray,
+              ...values: unknown[]
+            ) => queryRawMock(query, ...values) as Promise<T>,
+          },
+        }),
+      ).rejects.toThrow(RangeError);
+      expect(queryRawMock).not.toHaveBeenCalled();
     });
   });
 });

@@ -200,6 +200,11 @@ describe("chat.prompts", () => {
     expect(prompt).toContain("Terror (terror)");
     expect(prompt).toContain("searchSemanticBooks");
     expect(prompt).toContain("searchBooks");
+    expect(prompt).toContain("getCatalogStats");
+    expect(prompt).toContain("findSimilarBooks");
+    expect(prompt).toContain("publishedAfter");
+    expect(prompt).toContain("publishedBefore");
+    expect(prompt).toContain("total");
     expect(prompt).toContain("Não chame nenhuma ferramenta");
   });
 
@@ -248,7 +253,7 @@ describe("chat.service", () => {
     );
 
     expect(recordedCalls).toHaveLength(1);
-    expect(recordedCalls[0]?.tools).toHaveLength(2);
+    expect(recordedCalls[0]?.tools).toHaveLength(4);
     expect(recordedCalls[0]?.tool_choice).toBe("auto");
     expect(recordedCalls[0]?.user).toBe("session-123");
 
@@ -1041,7 +1046,7 @@ describe("chat.service > streamChatMessage", () => {
     expect(recordedCalls[0]?.body.stream_options).toEqual({
       include_usage: true,
     });
-    expect(recordedCalls[0]?.body.tools).toHaveLength(2);
+    expect(recordedCalls[0]?.body.tools).toHaveLength(4);
     expect(recordedCalls[0]?.signal).toBe(controller.signal);
 
     expect(result).toEqual({
@@ -1678,5 +1683,279 @@ describe("chat.service > streamChatMessage", () => {
       ),
     ).rejects.toMatchObject({ name: "AbortError" });
     expect(abortRedisDeltas).toEqual([]);
+  });
+
+  it("executes getCatalogStats in both processChatMessage and streamChatMessage and returns real catalog stats without cited books", async () => {
+    const getCatalogStatsMock = mock(async () => ({
+      totalBooks: 15,
+      averageRating: 4.5,
+      booksByGenre: [
+        { slug: "ficcao-cientifica", name: "Ficção Científica", count: 8 },
+      ],
+      oldestPublishedAt: new Date("1951-01-01T00:00:00.000Z"),
+      newestPublishedAt: new Date("2023-06-01T00:00:00.000Z"),
+    }));
+
+    const { deps, recordedCalls } = createBaseDeps(
+      [
+        makeCompletion({
+          toolCalls: [makeToolCall("call_stats", "getCatalogStats", "{}")],
+          usage: { prompt: 100, completion: 15, total: 115 },
+        }),
+        makeCompletion({
+          content:
+            "Temos 15 livros no catálogo, com nota média de 4,5 e destaque para Ficção Científica (8 livros).",
+          usage: { prompt: 180, completion: 25, total: 205 },
+        }),
+      ],
+      {
+        toolDeps: {
+          getCatalogStats: getCatalogStatsMock,
+        },
+      },
+    );
+
+    const result = await processChatMessage(
+      { token: "session-stats", message: "Quantos livros temos e qual a média?" },
+      deps,
+    );
+
+    expect(getCatalogStatsMock).toHaveBeenCalledTimes(1);
+    const toolMessage = recordedCalls[1]?.messages.find((m) => m.role === "tool");
+    expect(JSON.parse(String(toolMessage?.content))).toEqual({
+      totalBooks: 15,
+      averageRating: 4.5,
+      booksByGenre: [
+        { slug: "ficcao-cientifica", name: "Ficção Científica", count: 8 },
+      ],
+      oldestPublishedAt: "1951-01-01T00:00:00.000Z",
+      newestPublishedAt: "2023-06-01T00:00:00.000Z",
+    });
+    expect(result.data.books).toEqual([]);
+    expect(result.data.modelReply).toContain("15 livros");
+
+    const streamDeltas: string[] = [];
+    const { deps: streamDeps, recordedCalls: streamCalls } = createStreamDeps(
+      [
+        () =>
+          chunksToStream([
+            makeChunk({
+              toolCalls: [
+                {
+                  index: 0,
+                  id: "call_stats_stream",
+                  type: "function",
+                  function: {
+                    name: "getCatalogStats",
+                    arguments: "{}",
+                  },
+                },
+              ],
+            }),
+            makeChunk({
+              emptyChoices: true,
+              usage: { prompt: 100, completion: 15, total: 115 },
+            }),
+          ]),
+        () =>
+          chunksToStream([
+            makeChunk({ content: "O catálogo possui 15 livros." }),
+            makeChunk({ finishReason: "stop" }),
+            makeChunk({
+              emptyChoices: true,
+              usage: { prompt: 180, completion: 12, total: 192 },
+            }),
+          ]),
+      ],
+      {
+        toolDeps: {
+          getCatalogStats: getCatalogStatsMock,
+        },
+      },
+    );
+
+    const streamStatsRes = await streamChatMessage(
+      {
+        token: "session-stats-stream",
+        message: "Quantos livros temos?",
+        onDelta: (delta) => streamDeltas.push(delta),
+      },
+      streamDeps,
+    );
+
+    expect(getCatalogStatsMock).toHaveBeenCalledTimes(2);
+    const streamToolMessage = streamCalls[1]?.body.messages.find(
+      (m) => m.role === "tool",
+    );
+    expect(JSON.parse(String(streamToolMessage?.content))).toEqual({
+      totalBooks: 15,
+      averageRating: 4.5,
+      booksByGenre: [
+        { slug: "ficcao-cientifica", name: "Ficção Científica", count: 8 },
+      ],
+      oldestPublishedAt: "1951-01-01T00:00:00.000Z",
+      newestPublishedAt: "2023-06-01T00:00:00.000Z",
+    });
+    expect(streamDeltas).toEqual(["O catálogo possui 15 livros."]);
+    expect(streamStatsRes.data.books).toEqual([]);
+    expect(streamStatsRes.data.modelReply).toBe("O catálogo possui 15 livros.");
+  });
+
+  it("executes findSimilarBooks (by bookId and by title) in processChatMessage and streamChatMessage and exposes similarity (1-100) on cited books", async () => {
+    const solaris = makeSimilarBook({
+      id: "solaris-id",
+      title: "Solaris",
+      similarity: 0.876,
+    });
+    const uncited = makeSimilarBook({
+      id: "uncited-id",
+      title: "Encontro com Rama",
+      similarity: 0.9,
+    });
+
+    const findSimilarByIdMock = mock(async () => ({
+      status: "ok" as const,
+      sourceBook: { id: "duna-id", title: "Duna", author: "Frank Herbert" },
+      books: [solaris, uncited],
+    }));
+
+    const { deps } = createBaseDeps(
+      [
+        makeCompletion({
+          toolCalls: [
+            makeToolCall(
+              "call_sim_book",
+              "findSimilarBooks",
+              JSON.stringify({ bookId: "duna-id", limit: 3 }),
+            ),
+          ],
+          usage: { prompt: 110, completion: 20, total: 130 },
+        }),
+        makeCompletion({
+          content:
+            "Como você gostou de **Duna**, recomendo **Solaris** por Stanislaw Lem.",
+          usage: { prompt: 200, completion: 22, total: 222 },
+        }),
+      ],
+      {
+        toolDeps: {
+          findSimilarBooksByBookId: findSimilarByIdMock,
+        },
+      },
+    );
+
+    const nonStreamResult = await processChatMessage(
+      { token: "session-sim-nonstream", message: "Livros parecidos com Duna" },
+      deps,
+    );
+
+    expect(findSimilarByIdMock).toHaveBeenCalledWith("duna-id", 3, 0.25);
+    expect(nonStreamResult.data.books).toHaveLength(1);
+    expect(nonStreamResult.data.books[0]?.id).toBe("solaris-id");
+    expect(nonStreamResult.data.books[0]?.similarity).toBe(88);
+
+    const dunaBook = makeStructuredBook({
+      id: "duna-id",
+      title: "Duna",
+      author: "Frank Herbert",
+    });
+    const listBooksForTitleMock = mock(async () => ({
+      books: [dunaBook],
+      meta: { total: 1, page: 1, limit: 50, totalPages: 1 },
+    }));
+
+    const { deps: titleDeps } = createBaseDeps(
+      [
+        makeCompletion({
+          toolCalls: [
+            makeToolCall(
+              "call_sim_title",
+              "findSimilarBooks",
+              JSON.stringify({ title: "Duna", limit: 3 }),
+            ),
+          ],
+          usage: { prompt: 110, completion: 20, total: 130 },
+        }),
+        makeCompletion({
+          content:
+            "Para quem curtiu **Duna**, uma ótima pedida é **Solaris** por Stanislaw Lem.",
+          usage: { prompt: 200, completion: 22, total: 222 },
+        }),
+      ],
+      {
+        toolDeps: {
+          listBooks: listBooksForTitleMock,
+          findSimilarBooksByBookId: findSimilarByIdMock,
+        },
+      },
+    );
+
+    const titleNonStreamRes = await processChatMessage(
+      { token: "session-sim-title", message: "Algo parecido com Duna?" },
+      titleDeps,
+    );
+
+    expect(listBooksForTitleMock).toHaveBeenCalledWith({
+      title: "Duna",
+      page: 1,
+      limit: 50,
+      sortBy: "title",
+      order: "asc",
+    });
+    expect(titleNonStreamRes.data.books).toHaveLength(1);
+    expect(titleNonStreamRes.data.books[0]?.id).toBe("solaris-id");
+    expect(titleNonStreamRes.data.books[0]?.similarity).toBe(88);
+
+    const { deps: streamDeps } = createStreamDeps(
+      [
+        () =>
+          chunksToStream([
+            makeChunk({
+              toolCalls: [
+                {
+                  index: 0,
+                  id: "call_sim_stream",
+                  type: "function",
+                  function: {
+                    name: "findSimilarBooks",
+                    arguments: JSON.stringify({ title: "Duna", limit: 3 }),
+                  },
+                },
+              ],
+            }),
+            makeChunk({
+              emptyChoices: true,
+              usage: { prompt: 110, completion: 20, total: 130 },
+            }),
+          ]),
+        () =>
+          chunksToStream([
+            makeChunk({
+              content:
+                "Se curtiu **Duna**, vale ler **Solaris** por Stanislaw Lem.",
+            }),
+            makeChunk({ finishReason: "stop" }),
+            makeChunk({
+              emptyChoices: true,
+              usage: { prompt: 200, completion: 22, total: 222 },
+            }),
+          ]),
+      ],
+      {
+        toolDeps: {
+          listBooks: listBooksForTitleMock,
+          findSimilarBooksByBookId: findSimilarByIdMock,
+        },
+      },
+    );
+
+    const streamResult = await streamChatMessage(
+      { token: "session-sim-stream", message: "Livros parecidos com Duna" },
+      streamDeps,
+    );
+
+    expect(streamResult.data.books).toHaveLength(1);
+    expect(streamResult.data.books[0]?.id).toBe("solaris-id");
+    expect(streamResult.data.books[0]?.similarity).toBe(88);
   });
 });

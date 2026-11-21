@@ -203,6 +203,106 @@ describe("book.routes", () => {
 
       await app.close();
     });
+
+    it("forwards valid publishedAfter/publishedBefore filters and returns 400 for invalid dates or inverted intervals", async () => {
+      const capturedQueries: Record<string, unknown>[] = [];
+      const listBooksMock = mock(async (query: Record<string, unknown>) => {
+        capturedQueries.push(query);
+        return {
+          books: [makeBook()],
+          meta: { total: 1, page: 1, limit: 10, totalPages: 1 },
+        };
+      });
+
+      const app = buildTestApp({
+        listBooks: listBooksMock as BookRoutesOptions["listBooks"],
+      });
+
+      const validRes = await app.inject({
+        method: "GET",
+        url: "/api/books?publishedAfter=1960-01-01&publishedBefore=1969-12-31",
+      });
+      expect(validRes.statusCode).toBe(200);
+      expect(capturedQueries[0]).toMatchObject({
+        publishedAfter: "1960-01-01",
+        publishedBefore: "1969-12-31",
+      });
+
+      const afterOnlyRes = await app.inject({
+        method: "GET",
+        url: "/api/books?publishedAfter=1980-01-01",
+      });
+      expect(afterOnlyRes.statusCode).toBe(200);
+      expect(capturedQueries[1]).toMatchObject({
+        publishedAfter: "1980-01-01",
+      });
+      expect(capturedQueries[1]?.publishedBefore).toBeUndefined();
+
+      const beforeOnlyRes = await app.inject({
+        method: "GET",
+        url: "/api/books?publishedBefore=1999-12-31",
+      });
+      expect(beforeOnlyRes.statusCode).toBe(200);
+      expect(capturedQueries[2]).toMatchObject({
+        publishedBefore: "1999-12-31",
+      });
+      expect(capturedQueries[2]?.publishedAfter).toBeUndefined();
+
+      const isoOffsetRes = await app.inject({
+        method: "GET",
+        url: "/api/books?publishedAfter=1965-08-01T00:00:00Z&publishedBefore=1965-08-01T12:00:00-03:00",
+      });
+      expect(isoOffsetRes.statusCode).toBe(200);
+      expect(capturedQueries[3]).toMatchObject({
+        publishedAfter: "1965-08-01T00:00:00Z",
+        publishedBefore: "1965-08-01T12:00:00-03:00",
+      });
+
+      const sameDayRes = await app.inject({
+        method: "GET",
+        url: "/api/books?publishedAfter=2020-02-29&publishedBefore=2020-02-29",
+      });
+      expect(sameDayRes.statusCode).toBe(200);
+
+      const searchCombinedRes = await app.inject({
+        method: "GET",
+        url: "/api/books?search=duna&publishedAfter=1960-01-01&publishedBefore=1969-12-31",
+      });
+      expect(searchCombinedRes.statusCode).toBe(200);
+      expect(capturedQueries[5]).toMatchObject({
+        search: "duna",
+        publishedAfter: "1960-01-01",
+        publishedBefore: "1969-12-31",
+      });
+
+      const invertedRes = await app.inject({
+        method: "GET",
+        url: "/api/books?publishedAfter=2020-01-01&publishedBefore=2010-01-01",
+      });
+      expect(invertedRes.statusCode).toBe(400);
+
+      const rolloverRes = await app.inject({
+        method: "GET",
+        url: "/api/books?publishedAfter=2020-02-31",
+      });
+      expect(rolloverRes.statusCode).toBe(400);
+
+      const yearZeroRes = await app.inject({
+        method: "GET",
+        url: "/api/books?publishedAfter=0000-01-01",
+      });
+      expect(yearZeroRes.statusCode).toBe(400);
+
+      const invalidTextRes = await app.inject({
+        method: "GET",
+        url: "/api/books?publishedBefore=abc",
+      });
+      expect(invalidTextRes.statusCode).toBe(400);
+
+      expect(listBooksMock).toHaveBeenCalledTimes(6);
+
+      await app.close();
+    });
   });
 
   describe("admin-protected mutation routes", () => {
@@ -437,6 +537,11 @@ describe("book.routes", () => {
         (param) => param.name === "sortBy" && param.in === "query",
       );
       expect(sortByParam?.schema?.enum).toContain("relevance");
+      const queryParamNames = spec.paths?.["/api/books"]?.get?.parameters
+        ?.filter((param) => param.in === "query")
+        .map((param) => param.name);
+      expect(queryParamNames).toContain("publishedAfter");
+      expect(queryParamNames).toContain("publishedBefore");
       expect(spec.paths?.["/api/books/{id}"]?.get?.security).toBeUndefined();
 
       expect(spec.paths?.["/api/books"]?.post?.security).toEqual([

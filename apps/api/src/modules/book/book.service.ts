@@ -25,26 +25,116 @@ export const updateBookInputSchema = z.object({
 export type BookInput = z.infer<typeof bookInputSchema>;
 export type UpdateBookInput = z.infer<typeof updateBookInputSchema>;
 
-export const listBooksQuerySchema = z.object({
-  search: z.string().trim().optional(),
-  title: z.string().trim().optional(),
-  author: z.string().trim().optional(),
-  genre: z.string().trim().optional(),
-  minRating: z.coerce.number().min(0).max(5).optional(),
-  page: z.coerce.number().int().min(1).default(1),
-  limit: z.coerce.number().int().min(1).max(50).default(10),
-  sortBy: z
-    .enum([
-      "title",
-      "author",
-      "rating",
-      "publishedAt",
-      "createdAt",
-      "relevance",
-    ])
-    .optional(),
-  order: z.enum(["asc", "desc"]).default("desc"),
-});
+const DATE_ONLY_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
+const isoDateTimeSchema = z.iso.datetime({ offset: true });
+
+/**
+ * Parses a date filter string (`YYYY-MM-DD` or ISO 8601 datetime with offset)
+ * without silent calendar rollover, normalizing date-only strings to day start/end UTC.
+ */
+export const parsePublishedDateBoundary = (
+  value: string,
+  boundary: "start" | "end",
+): Date | null => {
+  const trimmed = value.trim();
+  const dateOnlyMatch = DATE_ONLY_REGEX.exec(trimmed);
+
+  if (dateOnlyMatch) {
+    const year = Number(dateOnlyMatch[1]);
+    const month = Number(dateOnlyMatch[2]);
+    const day = Number(dateOnlyMatch[3]);
+
+    if (year < 1) {
+      return null;
+    }
+
+    const date = new Date(0);
+    date.setUTCFullYear(year, month - 1, day);
+    date.setUTCHours(
+      boundary === "end" ? 23 : 0,
+      boundary === "end" ? 59 : 0,
+      boundary === "end" ? 59 : 0,
+      boundary === "end" ? 999 : 0,
+    );
+
+    if (
+      Number.isNaN(date.getTime()) ||
+      date.getUTCFullYear() !== year ||
+      date.getUTCMonth() !== month - 1 ||
+      date.getUTCDate() !== day
+    ) {
+      return null;
+    }
+
+    return date;
+  }
+
+  if (!isoDateTimeSchema.safeParse(trimmed).success) {
+    return null;
+  }
+
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime()) || parsed.getUTCFullYear() < 1) {
+    return null;
+  }
+
+  return parsed;
+};
+
+export const publishedDateStringSchema = z
+  .string()
+  .trim()
+  .refine((value) => parsePublishedDateBoundary(value, "start") !== null, {
+    message:
+      "Invalid date format. Expected YYYY-MM-DD or ISO 8601 datetime with timezone (e.g. 1960-01-01 or 1960-01-01T00:00:00Z).",
+  });
+
+export const addPublishedDateRangeRefinement = <
+  T extends { publishedAfter?: string; publishedBefore?: string },
+>(
+  data: T,
+  ctx: z.RefinementCtx,
+) => {
+  if (!data.publishedAfter || !data.publishedBefore) {
+    return;
+  }
+
+  const afterDate = parsePublishedDateBoundary(data.publishedAfter, "start");
+  const beforeDate = parsePublishedDateBoundary(data.publishedBefore, "end");
+
+  if (afterDate && beforeDate && afterDate.getTime() > beforeDate.getTime()) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["publishedAfter"],
+      message: "publishedAfter must be less than or equal to publishedBefore.",
+    });
+  }
+};
+
+export const listBooksQuerySchema = z
+  .object({
+    search: z.string().trim().optional(),
+    title: z.string().trim().optional(),
+    author: z.string().trim().optional(),
+    genre: z.string().trim().optional(),
+    minRating: z.coerce.number().min(0).max(5).optional(),
+    publishedAfter: publishedDateStringSchema.optional(),
+    publishedBefore: publishedDateStringSchema.optional(),
+    page: z.coerce.number().int().min(1).default(1),
+    limit: z.coerce.number().int().min(1).max(50).default(10),
+    sortBy: z
+      .enum([
+        "title",
+        "author",
+        "rating",
+        "publishedAt",
+        "createdAt",
+        "relevance",
+      ])
+      .optional(),
+    order: z.enum(["asc", "desc"]).default("desc"),
+  })
+  .superRefine(addPublishedDateRangeRefinement);
 
 export type ListBooksQuery = z.infer<typeof listBooksQuerySchema>;
 
@@ -246,12 +336,48 @@ const hydrateRawBook = (row: RawBookRow): BookWithGenres => {
   };
 };
 
+const resolvePublishedDateRange = (
+  publishedAfter?: string,
+  publishedBefore?: string,
+): { publishedAfterDate?: Date; publishedBeforeDate?: Date } => {
+  let publishedAfterDate: Date | undefined;
+  let publishedBeforeDate: Date | undefined;
+
+  if (publishedAfter !== undefined) {
+    const parsed = parsePublishedDateBoundary(publishedAfter, "start");
+    if (!parsed) {
+      throw new Error(`Invalid publishedAfter date: "${publishedAfter}"`);
+    }
+    publishedAfterDate = parsed;
+  }
+
+  if (publishedBefore !== undefined) {
+    const parsed = parsePublishedDateBoundary(publishedBefore, "end");
+    if (!parsed) {
+      throw new Error(`Invalid publishedBefore date: "${publishedBefore}"`);
+    }
+    publishedBeforeDate = parsed;
+  }
+
+  if (
+    publishedAfterDate &&
+    publishedBeforeDate &&
+    publishedAfterDate.getTime() > publishedBeforeDate.getTime()
+  ) {
+    throw new Error("publishedAfter must be less than or equal to publishedBefore");
+  }
+
+  return { publishedAfterDate, publishedBeforeDate };
+};
+
 const buildFtsWhereSql = (params: {
   tsQuery: string;
   title?: string;
   author?: string;
   genre?: string;
   minRating?: number;
+  publishedAfter?: Date;
+  publishedBefore?: Date;
 }): Prisma.Sql => {
   const conditions: Prisma.Sql[] = [
     Prisma.sql`b."search_vector" @@ to_tsquery('simple', public.unaccent(${params.tsQuery}))`,
@@ -288,11 +414,20 @@ const buildFtsWhereSql = (params: {
     conditions.push(Prisma.sql`b."rating" >= ${params.minRating}`);
   }
 
+  if (params.publishedAfter !== undefined) {
+    conditions.push(Prisma.sql`b."publishedAt" >= ${params.publishedAfter}`);
+  }
+
+  if (params.publishedBefore !== undefined) {
+    conditions.push(Prisma.sql`b."publishedAt" <= ${params.publishedBefore}`);
+  }
+
   return Prisma.join(conditions, " AND ");
 };
 
 const listBooksWithPrisma = async (
   query: ListBooksQuery,
+  dateRange: { publishedAfterDate?: Date; publishedBeforeDate?: Date },
   db: NonNullable<ListBooksDeps["prisma"]>,
 ) => {
   if (!db.book) {
@@ -300,6 +435,7 @@ const listBooksWithPrisma = async (
   }
 
   const { title, author, genre, minRating, page, limit, sortBy, order } = query;
+  const { publishedAfterDate, publishedBeforeDate } = dateRange;
   const whereConditions: Prisma.BookWhereInput[] = [];
 
   if (title) {
@@ -330,6 +466,15 @@ const listBooksWithPrisma = async (
   if (minRating !== undefined) {
     whereConditions.push({
       rating: { gte: minRating },
+    });
+  }
+
+  if (publishedAfterDate !== undefined || publishedBeforeDate !== undefined) {
+    whereConditions.push({
+      publishedAt: {
+        ...(publishedAfterDate !== undefined && { gte: publishedAfterDate }),
+        ...(publishedBeforeDate !== undefined && { lte: publishedBeforeDate }),
+      },
     });
   }
 
@@ -372,6 +517,7 @@ const listBooksWithPrisma = async (
 const listBooksWithFts = async (
   query: ListBooksQuery,
   tsQuery: string,
+  dateRange: { publishedAfterDate?: Date; publishedBeforeDate?: Date },
   db: NonNullable<ListBooksDeps["prisma"]>,
 ) => {
   if (!db.$queryRaw) {
@@ -386,6 +532,8 @@ const listBooksWithFts = async (
     author: author?.trim() || undefined,
     genre: genre?.trim() || undefined,
     minRating,
+    publishedAfter: dateRange.publishedAfterDate,
+    publishedBefore: dateRange.publishedBeforeDate,
   });
   const orderBySql = getFtsOrderBySql(sortBy, order);
 
@@ -479,10 +627,14 @@ export const listBooks = async (
   deps?: ListBooksDeps,
 ) => {
   const db: NonNullable<ListBooksDeps["prisma"]> = deps?.prisma ?? prisma;
+  const dateRange = resolvePublishedDateRange(
+    query.publishedAfter,
+    query.publishedBefore,
+  );
   const trimmedSearch = query.search?.trim();
 
   if (!trimmedSearch) {
-    return listBooksWithPrisma(query, db);
+    return listBooksWithPrisma(query, dateRange, db);
   }
 
   const tsQuery = buildPrefixTsQuery(trimmedSearch);
@@ -498,7 +650,7 @@ export const listBooks = async (
     };
   }
 
-  return listBooksWithFts(query, tsQuery, db);
+  return listBooksWithFts(query, tsQuery, dateRange, db);
 };
 
 type ExecuteRawClient = {
@@ -991,4 +1143,325 @@ export async function findSimilarBooks(
       tb."similarity"
     ORDER BY tb."similarity" DESC
   `;
+}
+
+export interface GenreBookCount {
+  slug: string;
+  name: string;
+  count: number;
+}
+
+export interface CatalogStats {
+  totalBooks: number;
+  averageRating: number | null;
+  booksByGenre: GenreBookCount[];
+  oldestPublishedAt: Date | null;
+  newestPublishedAt: Date | null;
+}
+
+export interface GetCatalogStatsDeps {
+  prisma?: {
+    book: {
+      aggregate: (args: {
+        _count: { _all: true };
+        _avg: { rating: true };
+        _min: { publishedAt: true };
+        _max: { publishedAt: true };
+      }) => Promise<{
+        _count: { _all: number };
+        _avg: { rating: number | null };
+        _min: { publishedAt: Date | string | null };
+        _max: { publishedAt: Date | string | null };
+      }>;
+    };
+    genre: {
+      findMany: (args: {
+        select: {
+          slug: true;
+          name: true;
+          _count: {
+            select: { books: true };
+          };
+        };
+        orderBy: Prisma.GenreOrderByWithRelationInput[];
+      }) => Promise<
+        {
+          slug: string;
+          name: string;
+          _count: { books: number };
+        }[]
+      >;
+    };
+  };
+}
+
+const CATALOG_BOOK_AGGREGATE_ARGS = {
+  _count: { _all: true },
+  _avg: { rating: true },
+  _min: { publishedAt: true },
+  _max: { publishedAt: true },
+} as const;
+
+const CATALOG_GENRE_SELECT = {
+  slug: true,
+  name: true,
+  _count: {
+    select: { books: true },
+  },
+} as const;
+
+/**
+ * Computes real-time catalog statistics using database aggregations without loading books into memory.
+ */
+export async function getCatalogStats(
+  deps?: GetCatalogStatsDeps,
+): Promise<CatalogStats> {
+  const customDb = deps?.prisma;
+  const genreOrderBy: Prisma.GenreOrderByWithRelationInput[] = [
+    { books: { _count: "desc" } },
+    { name: "asc" },
+  ];
+
+  const [bookAggregate, genres] = await Promise.all([
+    customDb
+      ? customDb.book.aggregate(CATALOG_BOOK_AGGREGATE_ARGS)
+      : prisma.book.aggregate(CATALOG_BOOK_AGGREGATE_ARGS),
+    customDb
+      ? customDb.genre.findMany({
+          select: CATALOG_GENRE_SELECT,
+          orderBy: genreOrderBy,
+        })
+      : prisma.genre.findMany({
+          select: CATALOG_GENRE_SELECT,
+          orderBy: genreOrderBy,
+        }),
+  ]);
+
+  const totalBooks = Number(bookAggregate._count._all ?? 0);
+  const rawAverageRating = bookAggregate._avg.rating;
+  const numericAverageRating =
+    rawAverageRating !== null && rawAverageRating !== undefined
+      ? Number(rawAverageRating)
+      : Number.NaN;
+
+  return {
+    totalBooks,
+    averageRating: Number.isFinite(numericAverageRating)
+      ? numericAverageRating
+      : null,
+    booksByGenre: genres.map((genre) => ({
+      slug: genre.slug,
+      name: genre.name,
+      count: Number(genre._count.books ?? 0),
+    })),
+    oldestPublishedAt: toNullableDate(bookAggregate._min.publishedAt),
+    newestPublishedAt: toNullableDate(bookAggregate._max.publishedAt),
+  };
+}
+
+export type SimilarBookSource = {
+  id: string;
+  title: string;
+  author: string;
+};
+
+export type FindSimilarBooksByBookIdResult =
+  | {
+      status: "ok";
+      sourceBook: SimilarBookSource;
+      books: SimilarBook[];
+    }
+  | {
+      status: "not_found";
+    }
+  | {
+      status: "no_embedding";
+      sourceBook: SimilarBookSource;
+    };
+
+export interface FindSimilarBooksByBookIdDeps {
+  prisma?: {
+    $queryRaw: <T = unknown>(
+      query: TemplateStringsArray,
+      ...values: unknown[]
+    ) => Promise<T>;
+  };
+}
+
+type SourceBookEmbeddingRow = {
+  id: string;
+  title: string;
+  author: string;
+  embeddingText: string | null;
+};
+
+type RawSimilarBookRow = Omit<
+  SimilarBook,
+  "publishedAt" | "createdAt" | "genres"
+> & {
+  publishedAt: Date | string | null;
+  createdAt: Date | string;
+  genres: { slug: string; name: string }[] | string | null;
+};
+
+const parseRawGenres = (
+  genres: RawSimilarBookRow["genres"],
+): { slug: string; name: string }[] => {
+  if (Array.isArray(genres)) {
+    return genres;
+  }
+
+  if (typeof genres === "string") {
+    try {
+      const parsed: unknown = JSON.parse(genres);
+      return Array.isArray(parsed)
+        ? (parsed as { slug: string; name: string }[])
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  return [];
+};
+
+const hydrateSimilarBook = (row: RawSimilarBookRow): SimilarBook => {
+  const numericRating =
+    row.rating === null || row.rating === undefined
+      ? Number.NaN
+      : Number(row.rating);
+
+  return {
+    id: row.id,
+    title: row.title,
+    author: row.author,
+    description: row.description,
+    coverUrl: row.coverUrl,
+    rating: Number.isFinite(numericRating) ? numericRating : null,
+    publishedAt: toNullableDate(row.publishedAt),
+    createdAt: toDate(row.createdAt),
+    genres: parseRawGenres(row.genres),
+    similarity: Number(row.similarity),
+  };
+};
+
+/**
+ * Finds books similar to a persisted book by reusing its stored pgvector embedding
+ * via an HNSW-compatible top-K CTE, without invoking OpenAI Embeddings.
+ */
+export async function findSimilarBooksByBookId(
+  bookId: string,
+  limit = 5,
+  minSimilarity = DEFAULT_MIN_SIMILARITY,
+  deps?: FindSimilarBooksByBookIdDeps,
+): Promise<FindSimilarBooksByBookIdResult> {
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new RangeError("limit must be a positive integer");
+  }
+
+  if (
+    !Number.isFinite(minSimilarity) ||
+    minSimilarity < 0 ||
+    minSimilarity > 1
+  ) {
+    throw new RangeError("minSimilarity must be between 0 and 1");
+  }
+
+  const normalizedBookId = bookId.trim();
+  if (!normalizedBookId) {
+    return { status: "not_found" };
+  }
+
+  const db = deps?.prisma ?? prisma;
+
+  const sourceRows = await db.$queryRaw<SourceBookEmbeddingRow[]>`
+    SELECT
+      "id",
+      "title",
+      "author",
+      "embedding"::text AS "embeddingText"
+    FROM "books"
+    WHERE "id" = ${normalizedBookId}
+    LIMIT 1
+  `;
+
+  const sourceRow = sourceRows[0];
+  if (!sourceRow) {
+    return { status: "not_found" };
+  }
+
+  const sourceBook: SimilarBookSource = {
+    id: sourceRow.id,
+    title: sourceRow.title,
+    author: sourceRow.author,
+  };
+
+  if (!sourceRow.embeddingText) {
+    return {
+      status: "no_embedding",
+      sourceBook,
+    };
+  }
+
+  const rawSimilarRows = await db.$queryRaw<RawSimilarBookRow[]>`
+    WITH top_books AS (
+      SELECT
+        b."id",
+        b."title",
+        b."author",
+        b."description",
+        b."coverUrl",
+        b."rating",
+        b."publishedAt",
+        b."createdAt",
+        (
+          1 - (b."embedding" <=> ${sourceRow.embeddingText}::vector)
+        )::double precision AS similarity
+      FROM "books" b
+      WHERE b."embedding" IS NOT NULL
+        AND b."id" <> ${normalizedBookId}
+      ORDER BY b."embedding" <=> ${sourceRow.embeddingText}::vector
+      LIMIT ${limit}
+    )
+    SELECT
+      tb."id",
+      tb."title",
+      tb."author",
+      tb."description",
+      tb."coverUrl",
+      tb."rating",
+      tb."publishedAt",
+      tb."createdAt",
+      COALESCE(
+        json_agg(
+          json_build_object('slug', g."slug", 'name', g."name")
+        ) FILTER (WHERE g."slug" IS NOT NULL),
+        '[]'::json
+      ) AS "genres",
+      tb."similarity"
+    FROM top_books tb
+    LEFT JOIN "_BookToGenre" bg ON tb."id" = bg."A"
+    LEFT JOIN "genres" g ON bg."B" = g."slug"
+    GROUP BY
+      tb."id",
+      tb."title",
+      tb."author",
+      tb."description",
+      tb."coverUrl",
+      tb."rating",
+      tb."publishedAt",
+      tb."createdAt",
+      tb."similarity"
+    ORDER BY tb."similarity" DESC, tb."createdAt" DESC, tb."id" ASC
+  `;
+
+  const books = rawSimilarRows
+    .map(hydrateSimilarBook)
+    .filter((book) => book.similarity >= minSimilarity);
+
+  return {
+    status: "ok",
+    sourceBook,
+    books,
+  };
 }
