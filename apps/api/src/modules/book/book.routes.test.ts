@@ -13,7 +13,7 @@ import { env } from "@/config/env";
 import { errorHandler } from "@/errors";
 
 import { booksRoutes, type BookRoutesOptions } from "./book.routes";
-import type { BookWithGenres } from "./book.service";
+import { listBooks, type BookWithGenres } from "./book.service";
 
 const makeBook = (overrides: Partial<BookWithGenres> = {}): BookWithGenres => ({
   id: "book-1",
@@ -103,6 +103,103 @@ describe("book.routes", () => {
       });
       expect(notFoundRes.statusCode).toBe(404);
       expect(notFoundRes.json()).toEqual({ data: null });
+
+      await app.close();
+    });
+
+    it("accepts GET /api/books?sortBy=relevance without 400 and omits sortBy when absent", async () => {
+      const capturedQueries: Record<string, unknown>[] = [];
+      const listBooksMock = mock(async (query: Record<string, unknown>) => {
+        capturedQueries.push(query);
+        return {
+          books: [makeBook()],
+          meta: { total: 1, page: 1, limit: 10, totalPages: 1 },
+        };
+      });
+
+      const app = buildTestApp({
+        listBooks: listBooksMock as BookRoutesOptions["listBooks"],
+      });
+
+      const relevanceRes = await app.inject({
+        method: "GET",
+        url: "/api/books?search=duna&sortBy=relevance",
+      });
+      expect(relevanceRes.statusCode).toBe(200);
+      expect(capturedQueries[0]).toMatchObject({
+        search: "duna",
+        sortBy: "relevance",
+      });
+
+      const defaultRes = await app.inject({
+        method: "GET",
+        url: "/api/books?search=duna",
+      });
+      expect(defaultRes.statusCode).toBe(200);
+      expect(capturedQueries[1]?.search).toBe("duna");
+      expect(capturedQueries[1]?.sortBy).toBeUndefined();
+
+      await app.close();
+    });
+
+    it("serializes hydrated Date values from FTS listBooks through BookSchema without error", async () => {
+      const app = buildTestApp({
+        listBooks: (query) =>
+          listBooks(query, {
+            prisma: {
+              $queryRaw: async <T = unknown>(sqlQuery: unknown): Promise<T> => {
+                const rawSql = (sqlQuery as { sql: string }).sql;
+                if (rawSql.includes("COUNT(*)")) {
+                  return [{ total: BigInt(1) }] as T;
+                }
+                return [
+                  {
+                    id: "book-fts-1",
+                    title: "Duna",
+                    author: "Frank Herbert",
+                    description: "Arrakis",
+                    coverUrl: null,
+                    rating: 4.9,
+                    publishedAt: null,
+                    createdAt: "2026-01-01T00:00:00.000Z",
+                    updatedAt: "2026-01-02T00:00:00.000Z",
+                    genres: JSON.stringify([
+                      {
+                        slug: "ficcao-cientifica",
+                        name: "Ficção Científica",
+                        createdAt: "2026-01-01T00:00:00+00:00",
+                        updatedAt: "2026-01-02T00:00:00+00:00",
+                      },
+                    ]),
+                  },
+                ] as T;
+              },
+            },
+          }),
+      });
+
+      const res = await app.inject({
+        method: "GET",
+        url: "/api/books?search=duna&sortBy=relevance",
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.data[0]).toMatchObject({
+        id: "book-fts-1",
+        title: "Duna",
+        publishedAt: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-02T00:00:00.000Z",
+        genres: [
+          {
+            slug: "ficcao-cientifica",
+            name: "Ficção Científica",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-02T00:00:00.000Z",
+          },
+        ],
+      });
 
       await app.close();
     });
@@ -313,6 +410,11 @@ describe("book.routes", () => {
           Record<
             string,
             {
+              parameters?: {
+                name: string;
+                in: string;
+                schema?: { enum?: string[] };
+              }[];
               security?: unknown[];
               responses?: Record<string, unknown>;
             }
@@ -331,6 +433,10 @@ describe("book.routes", () => {
       });
 
       expect(spec.paths?.["/api/books"]?.get?.security).toBeUndefined();
+      const sortByParam = spec.paths?.["/api/books"]?.get?.parameters?.find(
+        (param) => param.name === "sortBy" && param.in === "query",
+      );
+      expect(sortByParam?.schema?.enum).toContain("relevance");
       expect(spec.paths?.["/api/books/{id}"]?.get?.security).toBeUndefined();
 
       expect(spec.paths?.["/api/books"]?.post?.security).toEqual([

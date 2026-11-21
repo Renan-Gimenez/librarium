@@ -45,7 +45,13 @@ export interface ApiErrorResponse {
   message: string;
 }
 
-export type BookSortBy = "title" | "author" | "rating" | "publishedAt" | "createdAt";
+export type BookSortBy =
+  | "title"
+  | "author"
+  | "rating"
+  | "publishedAt"
+  | "createdAt"
+  | "relevance";
 export type SortOrder = "asc" | "desc";
 
 export interface BooksQueryParams {

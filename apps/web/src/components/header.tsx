@@ -95,7 +95,7 @@ export const Header = React.forwardRef<HTMLElement, HeaderProps>(
               ref={inputRef}
               value={searchValue}
               onChange={(e) => onSearchChange?.(e.target.value)}
-              placeholder="Buscar por título, autor ou palavra-chave..."
+              placeholder="Buscar por título, autor ou sinopse..."
               aria-label="Buscar livros no acervo"
             />
             {searchValue ? (

@@ -1,5 +1,5 @@
 import { openai, prisma } from "@/lib";
-import type { Prisma } from "@/generated/prisma/client";
+import { Prisma } from "@/generated/prisma/client";
 import { z } from "zod";
 
 export const bookInputSchema = z.object({
@@ -34,8 +34,15 @@ export const listBooksQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(50).default(10),
   sortBy: z
-    .enum(["title", "author", "rating", "publishedAt", "createdAt"])
-    .default("createdAt"),
+    .enum([
+      "title",
+      "author",
+      "rating",
+      "publishedAt",
+      "createdAt",
+      "relevance",
+    ])
+    .optional(),
   order: z.enum(["asc", "desc"]).default("desc"),
 });
 
@@ -106,7 +113,7 @@ export type BookWithGenres = Prisma.BookGetPayload<{
 
 export interface ListBooksDeps {
   prisma?: {
-    book: {
+    book?: {
       findMany: (args: {
         where?: Prisma.BookWhereInput;
         include: { genres: true };
@@ -116,37 +123,184 @@ export interface ListBooksDeps {
       }) => Promise<BookWithGenres[]>;
       count: (args: { where?: Prisma.BookWhereInput }) => Promise<number>;
     };
+    $queryRaw?: <T = unknown>(
+      query: TemplateStringsArray | Prisma.Sql,
+      ...values: unknown[]
+    ) => Promise<T>;
   };
 }
 
-export const listBooks = async (
-  query: ListBooksQuery,
-  deps?: ListBooksDeps,
-) => {
-  const db: NonNullable<ListBooksDeps["prisma"]> = deps?.prisma ?? prisma;
-  const {
-    search,
-    title,
-    author,
-    genre,
-    minRating,
-    page,
-    limit,
-    sortBy,
-    order,
-  } = query;
+const MAX_FTS_TOKENS = 32;
 
-  const whereConditions: Prisma.BookWhereInput[] = [];
+/**
+ * Converts a user search string into a PostgreSQL prefix `tsquery` expression
+ * joining up to 32 Unicode alphanumeric tokens with `&` and `:*`, or returns `null` if none exist.
+ */
+export const buildPrefixTsQuery = (search: string): string | null => {
+  const tokens = search
+    .normalize("NFC")
+    .match(/[\p{L}\p{N}][\p{L}\p{N}\p{M}]*/gu);
 
-  if (search) {
-    whereConditions.push({
-      OR: [
-        { title: { contains: search, mode: "insensitive" } },
-        { author: { contains: search, mode: "insensitive" } },
-        { description: { contains: search, mode: "insensitive" } },
-      ],
-    });
+  if (!tokens || tokens.length === 0) {
+    return null;
   }
+
+  return tokens
+    .slice(0, MAX_FTS_TOKENS)
+    .map((token) => `${token}:*`)
+    .join(" & ");
+};
+
+type NonRelevanceSortBy = Exclude<
+  NonNullable<ListBooksQuery["sortBy"]>,
+  "relevance"
+>;
+type SortOrder = ListBooksQuery["order"];
+
+const FTS_ORDER_BY_MAP: Record<
+  `${NonRelevanceSortBy}_${SortOrder}` | "relevance",
+  Prisma.Sql
+> = {
+  relevance: Prisma.sql`"rank" DESC, b."createdAt" DESC, b."id" ASC`,
+  title_asc: Prisma.sql`b."title" ASC, "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+  title_desc: Prisma.sql`b."title" DESC, "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+  author_asc: Prisma.sql`b."author" ASC, "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+  author_desc: Prisma.sql`b."author" DESC, "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+  rating_asc: Prisma.sql`b."rating" ASC NULLS LAST, "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+  rating_desc: Prisma.sql`b."rating" DESC NULLS LAST, "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+  publishedAt_asc: Prisma.sql`b."publishedAt" ASC NULLS LAST, "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+  publishedAt_desc: Prisma.sql`b."publishedAt" DESC NULLS LAST, "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+  createdAt_asc: Prisma.sql`b."createdAt" ASC, "rank" DESC, b."id" ASC`,
+  createdAt_desc: Prisma.sql`b."createdAt" DESC, "rank" DESC, b."id" ASC`,
+};
+
+const getFtsOrderBySql = (
+  sortBy: ListBooksQuery["sortBy"],
+  order: SortOrder,
+): Prisma.Sql => {
+  const effectiveSortBy = sortBy ?? "relevance";
+
+  if (effectiveSortBy === "relevance") {
+    return FTS_ORDER_BY_MAP.relevance;
+  }
+
+  const key = `${effectiveSortBy}_${order}` as Exclude<
+    keyof typeof FTS_ORDER_BY_MAP,
+    "relevance"
+  >;
+  return FTS_ORDER_BY_MAP[key] ?? FTS_ORDER_BY_MAP.relevance;
+};
+
+type RawGenreRow = {
+  slug: string;
+  name: string;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+};
+
+type RawBookRow = {
+  id: string;
+  title: string;
+  author: string;
+  description: string | null;
+  coverUrl: string | null;
+  rating: number | null;
+  publishedAt: Date | string | null;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+  genres: RawGenreRow[] | string | null;
+};
+
+type CountRow = {
+  total: bigint | number | string;
+};
+
+const toDate = (value: Date | string): Date =>
+  value instanceof Date ? value : new Date(value);
+
+const toNullableDate = (value: Date | string | null | undefined): Date | null =>
+  value == null ? null : toDate(value);
+
+const hydrateRawBook = (row: RawBookRow): BookWithGenres => {
+  const rawGenres: RawGenreRow[] =
+    typeof row.genres === "string"
+      ? (JSON.parse(row.genres) as RawGenreRow[])
+      : (row.genres ?? []);
+
+  return {
+    id: row.id,
+    title: row.title,
+    author: row.author,
+    description: row.description,
+    coverUrl: row.coverUrl,
+    rating: row.rating,
+    publishedAt: toNullableDate(row.publishedAt),
+    createdAt: toDate(row.createdAt),
+    updatedAt: toDate(row.updatedAt),
+    genres: rawGenres.map((genre) => ({
+      slug: genre.slug,
+      name: genre.name,
+      createdAt: toDate(genre.createdAt),
+      updatedAt: toDate(genre.updatedAt),
+    })),
+  };
+};
+
+const buildFtsWhereSql = (params: {
+  tsQuery: string;
+  title?: string;
+  author?: string;
+  genre?: string;
+  minRating?: number;
+}): Prisma.Sql => {
+  const conditions: Prisma.Sql[] = [
+    Prisma.sql`b."search_vector" @@ to_tsquery('simple', public.unaccent(${params.tsQuery}))`,
+  ];
+
+  if (params.title) {
+    conditions.push(
+      Prisma.sql`STRPOS(LOWER(b."title"), LOWER(${params.title})) > 0`,
+    );
+  }
+
+  if (params.author) {
+    conditions.push(
+      Prisma.sql`STRPOS(LOWER(b."author"), LOWER(${params.author})) > 0`,
+    );
+  }
+
+  if (params.genre) {
+    conditions.push(
+      Prisma.sql`EXISTS (
+        SELECT 1
+        FROM "_BookToGenre" bg_filter
+        INNER JOIN "genres" g_filter ON g_filter."slug" = bg_filter."B"
+        WHERE bg_filter."A" = b."id"
+          AND (
+            LOWER(g_filter."slug") = LOWER(${params.genre})
+            OR LOWER(g_filter."name") = LOWER(${params.genre})
+          )
+      )`,
+    );
+  }
+
+  if (params.minRating !== undefined) {
+    conditions.push(Prisma.sql`b."rating" >= ${params.minRating}`);
+  }
+
+  return Prisma.join(conditions, " AND ");
+};
+
+const listBooksWithPrisma = async (
+  query: ListBooksQuery,
+  db: NonNullable<ListBooksDeps["prisma"]>,
+) => {
+  if (!db.book) {
+    throw new Error("Prisma book repository is required");
+  }
+
+  const { title, author, genre, minRating, page, limit, sortBy, order } = query;
+  const whereConditions: Prisma.BookWhereInput[] = [];
 
   if (title) {
     whereConditions.push({
@@ -183,11 +337,13 @@ export const listBooks = async (
     whereConditions.length > 0 ? { AND: whereConditions } : {};
 
   const skip = (page - 1) * limit;
+  const effectiveSortBy: NonRelevanceSortBy =
+    sortBy && sortBy !== "relevance" ? sortBy : "createdAt";
 
   const orderBy: Prisma.BookOrderByWithRelationInput =
-    sortBy === "rating" || sortBy === "publishedAt"
-      ? { [sortBy]: { sort: order, nulls: "last" } }
-      : { [sortBy]: order };
+    effectiveSortBy === "rating" || effectiveSortBy === "publishedAt"
+      ? { [effectiveSortBy]: { sort: order, nulls: "last" } }
+      : { [effectiveSortBy]: order };
 
   const [books, total] = await Promise.all([
     db.book.findMany({
@@ -202,17 +358,147 @@ export const listBooks = async (
     db.book.count({ where }),
   ]);
 
-  const totalPages = Math.ceil(total / limit);
-
   return {
     books,
     meta: {
       total,
       page,
       limit,
-      totalPages,
+      totalPages: Math.ceil(total / limit),
     },
   };
+};
+
+const listBooksWithFts = async (
+  query: ListBooksQuery,
+  tsQuery: string,
+  db: NonNullable<ListBooksDeps["prisma"]>,
+) => {
+  if (!db.$queryRaw) {
+    throw new Error("Prisma $queryRaw is required for search");
+  }
+
+  const { title, author, genre, minRating, page, limit, sortBy, order } = query;
+  const skip = (page - 1) * limit;
+  const whereSql = buildFtsWhereSql({
+    tsQuery,
+    title: title?.trim() || undefined,
+    author: author?.trim() || undefined,
+    genre: genre?.trim() || undefined,
+    minRating,
+  });
+  const orderBySql = getFtsOrderBySql(sortBy, order);
+
+  const dataQuery = Prisma.sql`
+    WITH matched_books AS (
+      SELECT
+        b."id",
+        b."title",
+        b."author",
+        b."description",
+        b."coverUrl",
+        b."rating",
+        b."publishedAt",
+        b."createdAt",
+        b."updatedAt",
+        ts_rank_cd(
+          b."search_vector",
+          to_tsquery('simple', public.unaccent(${tsQuery}))
+        )::double precision AS "rank"
+      FROM "books" b
+      WHERE ${whereSql}
+      ORDER BY ${orderBySql}
+      LIMIT ${limit}
+      OFFSET ${skip}
+    )
+    SELECT
+      b."id",
+      b."title",
+      b."author",
+      b."description",
+      b."coverUrl",
+      b."rating",
+      b."publishedAt",
+      b."createdAt",
+      b."updatedAt",
+      b."rank",
+      COALESCE(
+        json_agg(
+          json_build_object(
+            'slug', g."slug",
+            'name', g."name",
+            'createdAt', g."createdAt" AT TIME ZONE 'UTC',
+            'updatedAt', g."updatedAt" AT TIME ZONE 'UTC'
+          )
+        ) FILTER (WHERE g."slug" IS NOT NULL),
+        '[]'::json
+      ) AS "genres"
+    FROM matched_books b
+    LEFT JOIN "_BookToGenre" bg ON b."id" = bg."A"
+    LEFT JOIN "genres" g ON bg."B" = g."slug"
+    GROUP BY
+      b."id",
+      b."title",
+      b."author",
+      b."description",
+      b."coverUrl",
+      b."rating",
+      b."publishedAt",
+      b."createdAt",
+      b."updatedAt",
+      b."rank"
+    ORDER BY ${orderBySql}
+  `;
+
+  const countQuery = Prisma.sql`
+    SELECT COUNT(*) AS "total"
+    FROM "books" b
+    WHERE ${whereSql}
+  `;
+
+  const [rows, countRows] = await Promise.all([
+    db.$queryRaw<RawBookRow[]>(dataQuery),
+    db.$queryRaw<CountRow[]>(countQuery),
+  ]);
+
+  const total = Number(countRows[0]?.total ?? 0);
+
+  return {
+    books: rows.map(hydrateRawBook),
+    meta: {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    },
+  };
+};
+
+export const listBooks = async (
+  query: ListBooksQuery,
+  deps?: ListBooksDeps,
+) => {
+  const db: NonNullable<ListBooksDeps["prisma"]> = deps?.prisma ?? prisma;
+  const trimmedSearch = query.search?.trim();
+
+  if (!trimmedSearch) {
+    return listBooksWithPrisma(query, db);
+  }
+
+  const tsQuery = buildPrefixTsQuery(trimmedSearch);
+  if (!tsQuery) {
+    return {
+      books: [] as BookWithGenres[],
+      meta: {
+        total: 0,
+        page: query.page,
+        limit: query.limit,
+        totalPages: 0,
+      },
+    };
+  }
+
+  return listBooksWithFts(query, tsQuery, db);
 };
 
 type ExecuteRawClient = {

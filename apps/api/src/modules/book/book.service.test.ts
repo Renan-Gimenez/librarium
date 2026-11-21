@@ -1,9 +1,14 @@
 import { describe, expect, it, mock } from "bun:test";
 
+import { Prisma } from "@/generated/prisma/client";
+
+import { BookSchema } from "./book.routes";
 import {
+  buildPrefixTsQuery,
   createBook,
   findSimilarBooks,
   listBooks,
+  listBooksQuerySchema,
   searchSimilarBooks,
   updateBook,
   type CreateBookTx,
@@ -168,6 +173,347 @@ describe("book.service", () => {
         orderBy: Record<string, unknown>;
       };
       expect(titleArgs.orderBy).toEqual({ title: "asc" });
+    });
+
+    it("falls back safely to createdAt when sortBy is relevance without search", async () => {
+      const findManyMock = mock(async () => []);
+      const countMock = mock(async () => 0);
+
+      await listBooks(
+        {
+          page: 1,
+          limit: 10,
+          sortBy: "relevance",
+          order: "desc",
+        },
+        {
+          prisma: {
+            book: { findMany: findManyMock, count: countMock },
+          },
+        },
+      );
+
+      expect(findManyMock).toHaveBeenCalledTimes(1);
+      const args = (findManyMock.mock.calls[0] as unknown[])[0] as {
+        orderBy: Record<string, unknown>;
+      };
+      expect(args.orderBy).toEqual({ createdAt: "desc" });
+    });
+
+    it("builds prefix tsquery tokens for short terms, accents, combining marks, punctuation, caps at 32 tokens, and returns null when no alphanumeric tokens exist", () => {
+      expect(buildPrefixTsQuery("It")).toBe("It:*");
+      expect(buildPrefixTsQuery("Ficção cien")).toBe("Ficção:* & cien:*");
+      expect(buildPrefixTsQuery("ficcao")).toBe("ficcao:*");
+      expect(buildPrefixTsQuery("Ficc\u0327a\u0303o")).toBe("Ficção:*");
+      expect(buildPrefixTsQuery("x\u0301y cafe\u0301\u0327")).toBe(
+        "x\u0301y:* & caf\u0229\u0301:*",
+      );
+      expect(buildPrefixTsQuery("O'Reilly & Sons: (Vol. 2)!")).toBe(
+        "O:* & Reilly:* & Sons:* & Vol:* & 2:*",
+      );
+
+      const fortyTokens = Array.from({ length: 40 }, (_, i) => `t${i + 1}`).join(
+        " ",
+      );
+      const cappedResult = buildPrefixTsQuery(fortyTokens)!;
+      const cappedParts = cappedResult.split(" & ");
+      expect(cappedParts).toHaveLength(32);
+      expect(cappedParts[0]).toBe("t1:*");
+      expect(cappedParts[31]).toBe("t32:*");
+      expect(cappedResult).not.toContain("t33:*");
+
+      expect(buildPrefixTsQuery("!!! ---")).toBeNull();
+      expect(buildPrefixTsQuery("   ")).toBeNull();
+      expect(buildPrefixTsQuery("")).toBeNull();
+    });
+
+    it("defaults to createdAt desc in Prisma path when both search and sortBy are omitted via listBooksQuerySchema", async () => {
+      const findManyMock = mock(async () => []);
+      const countMock = mock(async () => 0);
+
+      await listBooks(listBooksQuerySchema.parse({}), {
+        prisma: {
+          book: { findMany: findManyMock, count: countMock },
+        },
+      });
+
+      expect(findManyMock).toHaveBeenCalledTimes(1);
+      const args = (findManyMock.mock.calls[0] as unknown[])[0] as {
+        orderBy: Record<string, unknown>;
+      };
+      expect(args.orderBy).toEqual({ createdAt: "desc" });
+    });
+
+    it("accepts relevance in listBooksQuerySchema and keeps omitted sortBy undefined", () => {
+      const withRelevance = listBooksQuerySchema.parse({
+        sortBy: "relevance",
+      });
+      expect(withRelevance.sortBy).toBe("relevance");
+
+      const withoutSortBy = listBooksQuerySchema.parse({
+        search: "duna",
+      });
+      expect(withoutSortBy.sortBy).toBeUndefined();
+
+      expect(() =>
+        listBooksQuerySchema.parse({ sortBy: "invalid" }),
+      ).toThrow();
+    });
+
+    it("returns empty paginated response without querying DB when search has only punctuation", async () => {
+      const findManyMock = mock(async () => []);
+      const countMock = mock(async () => 0);
+      const queryRawMock = mock(
+        async (_query: TemplateStringsArray | Prisma.Sql, ..._values: unknown[]) => [],
+      );
+
+      const result = await listBooks(
+        {
+          search: "!!! ---",
+          page: 2,
+          limit: 5,
+          order: "desc",
+        },
+        {
+          prisma: {
+            book: { findMany: findManyMock, count: countMock },
+            $queryRaw: <T = unknown>(
+              query: TemplateStringsArray | Prisma.Sql,
+              ...values: unknown[]
+            ) => queryRawMock(query, ...values) as Promise<T>,
+          },
+        },
+      );
+
+      expect(result).toEqual({
+        books: [],
+        meta: {
+          total: 0,
+          page: 2,
+          limit: 5,
+          totalPages: 0,
+        },
+      });
+      expect(findManyMock).not.toHaveBeenCalled();
+      expect(countMock).not.toHaveBeenCalled();
+      expect(queryRawMock).not.toHaveBeenCalled();
+    });
+
+    it("executes parameterized FTS with simple + public.unaccent, default ts_rank_cd DESC, parallel COUNT(*), and hydrates Date fields for BookSchema", async () => {
+      const findManyMock = mock(async () => []);
+      const countMock = mock(async () => 0);
+      const capturedQueries: { sql: string; values: unknown[] }[] = [];
+      let rawContextTag: string | undefined;
+
+      const rawRows = [
+        {
+          id: "book-it",
+          title: "It",
+          author: "Stephen King",
+          description: "Romance de terror em Derry.",
+          coverUrl: null,
+          rating: 4.7,
+          publishedAt: "1986-09-15T00:00:00.000Z",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-02T00:00:00.000Z",
+          genres: [
+            {
+              slug: "terror",
+              name: "Terror",
+              createdAt: "2026-01-01T00:00:00+00:00",
+              updatedAt: "2026-01-02T00:00:00+00:00",
+            },
+          ],
+        },
+      ];
+
+      const fakePrisma = {
+        contextTag: "fts-prisma",
+        book: { findMany: findManyMock, count: countMock },
+        async $queryRaw<T = unknown>(
+          this: { contextTag?: string },
+          query: TemplateStringsArray | Prisma.Sql,
+        ): Promise<T> {
+          rawContextTag = this?.contextTag;
+          const sqlObj = query as Prisma.Sql;
+          capturedQueries.push({
+            sql: sqlObj.sql,
+            values: [...sqlObj.values],
+          });
+
+          if (sqlObj.sql.includes("COUNT(*)")) {
+            return [{ total: BigInt(1) }] as T;
+          }
+          return rawRows as T;
+        },
+      };
+
+      const result = await listBooks(
+        {
+          search: "It",
+          page: 1,
+          limit: 10,
+          order: "desc",
+        },
+        { prisma: fakePrisma },
+      );
+
+      expect(rawContextTag).toBe("fts-prisma");
+      expect(findManyMock).not.toHaveBeenCalled();
+      expect(countMock).not.toHaveBeenCalled();
+      expect(capturedQueries).toHaveLength(2);
+
+      const dataQuery = capturedQueries.find((q) =>
+        q.sql.includes("ts_rank_cd"),
+      )!;
+      const countQuery = capturedQueries.find((q) =>
+        q.sql.includes("COUNT(*)"),
+      )!;
+
+      expect(dataQuery).toBeDefined();
+      expect(countQuery).toBeDefined();
+      expect(dataQuery.sql).not.toContain("ILIKE");
+      expect(dataQuery.sql).toContain(
+        `b."search_vector" @@ to_tsquery('simple', public.unaccent(?))`,
+      );
+      expect(dataQuery.sql).toContain(
+        `ts_rank_cd(\n          b."search_vector",\n          to_tsquery('simple', public.unaccent(?))\n        )`,
+      );
+      expect(dataQuery.sql).toContain(
+        `ORDER BY "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+      );
+      expect(dataQuery.values).toContain("It:*");
+      expect(dataQuery.values).toContain(10);
+      expect(dataQuery.values).toContain(0);
+
+      expect(countQuery.sql).toContain(
+        `b."search_vector" @@ to_tsquery('simple', public.unaccent(?))`,
+      );
+      expect(countQuery.values).toEqual(["It:*"]);
+
+      expect(result.meta).toEqual({
+        total: 1,
+        page: 1,
+        limit: 10,
+        totalPages: 1,
+      });
+      expect(result.books).toHaveLength(1);
+      expect(result.books[0]?.publishedAt).toBeInstanceOf(Date);
+      expect(result.books[0]?.createdAt).toBeInstanceOf(Date);
+      expect(result.books[0]?.updatedAt).toBeInstanceOf(Date);
+      expect(result.books[0]?.genres[0]?.createdAt).toBeInstanceOf(Date);
+      expect(result.books[0]?.genres[0]?.updatedAt).toBeInstanceOf(Date);
+
+      // Ensure hydrated objects pass BookSchema strictly
+      expect(() => BookSchema.parse(result.books[0])).not.toThrow();
+    });
+
+    it("supports explicit sortBy with rank DESC tie-breaker and combines filters + pagination in parallel COUNT(*)", async () => {
+      const capturedQueries: { sql: string; values: unknown[] }[] = [];
+
+      const queryRawMock = mock(
+        async (query: TemplateStringsArray | Prisma.Sql) => {
+          const sqlObj = query as Prisma.Sql;
+          capturedQueries.push({
+            sql: sqlObj.sql,
+            values: [...sqlObj.values],
+          });
+
+          if (sqlObj.sql.includes("COUNT(*)")) {
+            return [{ total: 12 }];
+          }
+          return [];
+        },
+      );
+
+      const queryRawWrapper = <T = unknown>(
+        query: TemplateStringsArray | Prisma.Sql,
+      ) => queryRawMock(query) as Promise<T>;
+
+      const ratingRes = await listBooks(
+        {
+          search: "O'Reilly & Sons: (Vol. 2)!",
+          title: "Duna",
+          author: "Frank",
+          genre: "ficcao-cientifica",
+          minRating: 4.5,
+          page: 2,
+          limit: 5,
+          sortBy: "rating",
+          order: "desc",
+        },
+        { prisma: { $queryRaw: queryRawWrapper } },
+      );
+
+      expect(ratingRes.meta).toEqual({
+        total: 12,
+        page: 2,
+        limit: 5,
+        totalPages: 3,
+      });
+
+      const dataQuery = capturedQueries[0]!;
+      const countQuery = capturedQueries[1]!;
+
+      expect(dataQuery.sql).toContain(
+        `ORDER BY b."rating" DESC NULLS LAST, "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+      );
+      expect(dataQuery.sql).toContain("LIMIT ?\n      OFFSET ?");
+      expect(dataQuery.values).toEqual([
+        "O:* & Reilly:* & Sons:* & Vol:* & 2:*",
+        "O:* & Reilly:* & Sons:* & Vol:* & 2:*",
+        "Duna",
+        "Frank",
+        "ficcao-cientifica",
+        "ficcao-cientifica",
+        4.5,
+        5,
+        5,
+      ]);
+
+      expect(countQuery.values).toEqual([
+        "O:* & Reilly:* & Sons:* & Vol:* & 2:*",
+        "Duna",
+        "Frank",
+        "ficcao-cientifica",
+        "ficcao-cientifica",
+        4.5,
+      ]);
+
+      capturedQueries.length = 0;
+
+      await listBooks(
+        {
+          search: "Ficção cien",
+          page: 1,
+          limit: 10,
+          sortBy: "createdAt",
+          order: "desc",
+        },
+        { prisma: { $queryRaw: queryRawWrapper } },
+      );
+
+      expect(capturedQueries[0]?.sql).toContain(
+        `ORDER BY b."createdAt" DESC, "rank" DESC, b."id" ASC`,
+      );
+      expect(capturedQueries[0]?.values).toContain("Ficção:* & cien:*");
+
+      capturedQueries.length = 0;
+
+      await listBooks(
+        {
+          search: "duna",
+          page: 1,
+          limit: 10,
+          sortBy: "relevance",
+          order: "asc",
+        },
+        { prisma: { $queryRaw: queryRawWrapper } },
+      );
+
+      expect(capturedQueries[0]?.sql).toContain(
+        `ORDER BY "rank" DESC, b."createdAt" DESC, b."id" ASC`,
+      );
     });
   });
 

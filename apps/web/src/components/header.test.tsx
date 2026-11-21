@@ -20,7 +20,7 @@ describe("Header component", () => {
     expect(assistantButton.getAttribute("aria-expanded")).toBe("true");
 
     const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
+      "Buscar por título, autor ou sinopse...",
     );
     expect(input).toBeDefined();
   });
@@ -44,7 +44,7 @@ describe("Header component", () => {
     render(<Wrapper />);
 
     const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
+      "Buscar por título, autor ou sinopse...",
     );
     fireEvent.change(input, { target: { value: "Foundation" } });
 
@@ -64,7 +64,7 @@ describe("Header component", () => {
     );
 
     const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
+      "Buscar por título, autor ou sinopse...",
     );
     const clearButton = screen.getByLabelText("Limpar busca");
     expect(clearButton).toBeDefined();
@@ -98,7 +98,7 @@ describe("Header component", () => {
     render(<Header />);
 
     const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
+      "Buscar por título, autor ou sinopse...",
     );
     expect(document.activeElement).not.toBe(input);
 
@@ -133,7 +133,7 @@ describe("Header component", () => {
     render(<Header />);
 
     const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
+      "Buscar por título, autor ou sinopse...",
     );
     (input as HTMLInputElement).blur();
 
@@ -161,7 +161,7 @@ describe("Header component", () => {
     );
 
     const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
+      "Buscar por título, autor ou sinopse...",
     );
     (input as HTMLInputElement).focus();
     expect(document.activeElement).toBe(input);
@@ -183,7 +183,7 @@ describe("Header component", () => {
     const { unmount } = render(<Header />);
 
     const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
+      "Buscar por título, autor ou sinopse...",
     );
     (input as HTMLInputElement).blur();
 

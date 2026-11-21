@@ -190,7 +190,7 @@ describe("App component integration", () => {
     renderWithClient(<App />);
 
     const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
+      "Buscar por título, autor ou sinopse...",
     );
     fireEvent.change(input, { target: { value: "Neuromancer" } });
 
@@ -243,7 +243,7 @@ describe("App component integration", () => {
     renderWithClient(<App />);
 
     const input = screen.getByPlaceholderText(
-      "Buscar por título, autor ou palavra-chave...",
+      "Buscar por título, autor ou sinopse...",
     );
     fireEvent.change(input, { target: { value: "inexistente" } });
 
@@ -463,5 +463,55 @@ describe("App component integration", () => {
     expect(screen.getByText("Assistente Literário")).toBeDefined();
 
     sendSpy.mockRestore();
+  });
+
+  it("omits sortBy during search so backend ranks by relevance, and sends sortBy when user explicitly chooses a sort option", async () => {
+    const bookRequests: Array<Record<string, unknown> | undefined> = [];
+
+    spyOn(api, "get").mockImplementation(((
+      url: string,
+      config?: { params?: Record<string, unknown> },
+    ) => {
+      if (url.includes("/genres")) {
+        return Promise.resolve(createAxiosResponse({ data: mockGenresList }));
+      }
+      if (url.includes("/books")) {
+        bookRequests.push(config?.params);
+        return Promise.resolve(createAxiosResponse(mockBooksResponse));
+      }
+      return Promise.reject(new Error(`Unhandled URL: ${url}`));
+    }) as unknown as typeof api.get);
+
+    renderWithClient(<App />);
+
+    await screen.findByRole("heading", { name: "Duna" });
+    expect(bookRequests[0]?.search).toBeUndefined();
+    expect(bookRequests[0]?.sortBy).toBe("createdAt");
+
+    const input = screen.getByPlaceholderText(
+      "Buscar por título, autor ou sinopse...",
+    );
+    fireEvent.change(input, { target: { value: "duna" } });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+
+    await waitFor(() => {
+      const searchCall = bookRequests.find((params) => params?.search === "duna");
+      expect(searchCall).toBeDefined();
+      expect(searchCall?.sortBy).toBeUndefined();
+    });
+
+    const sortSelect = screen.getByLabelText("Critério de ordenação");
+    fireEvent.change(sortSelect, { target: { value: "rating_desc" } });
+
+    await waitFor(() => {
+      const explicitSortCall = bookRequests.find(
+        (params) => params?.search === "duna" && params?.sortBy === "rating",
+      );
+      expect(explicitSortCall).toBeDefined();
+      expect(explicitSortCall?.order).toBe("desc");
+    });
   });
 });
