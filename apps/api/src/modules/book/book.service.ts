@@ -81,17 +81,49 @@ export const generateEmbedding = async (searchableText: string) => {
 export const saveBookEmbedding = async (
   bookId: string,
   embedding: number[],
+  deps?: {
+    prisma?: {
+      $executeRaw: (
+        query: TemplateStringsArray,
+        ...values: unknown[]
+      ) => Promise<unknown>;
+    };
+  },
 ) => {
+  const db = deps?.prisma ?? prisma;
   const vector = `[${embedding.join(",")}]`;
 
-  await prisma.$executeRaw`
+  await db.$executeRaw`
     UPDATE "books"
     SET "embedding" = ${vector}::vector
     WHERE "id" = ${bookId}
   `;
 };
 
-export const listBooks = async (query: ListBooksQuery) => {
+export type BookWithGenres = Prisma.BookGetPayload<{
+  include: { genres: true };
+}>;
+
+export interface ListBooksDeps {
+  prisma?: {
+    book: {
+      findMany: (args: {
+        where?: Prisma.BookWhereInput;
+        include: { genres: true };
+        orderBy?: Prisma.BookOrderByWithRelationInput;
+        skip?: number;
+        take?: number;
+      }) => Promise<BookWithGenres[]>;
+      count: (args: { where?: Prisma.BookWhereInput }) => Promise<number>;
+    };
+  };
+}
+
+export const listBooks = async (
+  query: ListBooksQuery,
+  deps?: ListBooksDeps,
+) => {
+  const db: NonNullable<ListBooksDeps["prisma"]> = deps?.prisma ?? prisma;
   const {
     search,
     title,
@@ -132,7 +164,10 @@ export const listBooks = async (query: ListBooksQuery) => {
     whereConditions.push({
       genres: {
         some: {
-          slug: { equals: genre, mode: "insensitive" },
+          OR: [
+            { slug: { equals: genre, mode: "insensitive" } },
+            { name: { equals: genre, mode: "insensitive" } },
+          ],
         },
       },
     });
@@ -149,19 +184,22 @@ export const listBooks = async (query: ListBooksQuery) => {
 
   const skip = (page - 1) * limit;
 
+  const orderBy: Prisma.BookOrderByWithRelationInput =
+    sortBy === "rating" || sortBy === "publishedAt"
+      ? { [sortBy]: { sort: order, nulls: "last" } }
+      : { [sortBy]: order };
+
   const [books, total] = await Promise.all([
-    prisma.book.findMany({
+    db.book.findMany({
       where,
       include: {
         genres: true,
       },
-      orderBy: {
-        [sortBy]: order,
-      },
+      orderBy,
       skip,
       take: limit,
     }),
-    prisma.book.count({ where }),
+    db.book.count({ where }),
   ]);
 
   const totalPages = Math.ceil(total / limit);
@@ -228,8 +266,90 @@ export const createBook = async (input: BookInput) => {
   return book;
 };
 
-export const updateBook = async (id: string, input: UpdateBookInput) => {
-  const existingBook = await prisma.book.findUnique({
+export interface UpdateBookDeps {
+  prisma?: {
+    book: {
+      findUnique: (args: {
+        where: { id: string };
+        include: { genres: true };
+      }) => Promise<BookWithGenres | null>;
+      update: (args: {
+        where: { id: string };
+        data: Prisma.BookUpdateInput;
+        include: { genres: true };
+      }) => Promise<BookWithGenres>;
+    };
+    genre: {
+      findMany: (args: {
+        where: { slug: { in: string[] } };
+      }) => Promise<{ slug: string; name: string }[]>;
+    };
+    $executeRaw?: (
+      query: TemplateStringsArray,
+      ...values: unknown[]
+    ) => Promise<unknown>;
+  };
+  generateEmbedding?: typeof generateEmbedding;
+  saveBookEmbedding?: typeof saveBookEmbedding;
+}
+
+const hasIndexableBookChanges = (
+  existingBook: {
+    title: string;
+    author: string;
+    description: string | null;
+    genres: { slug: string }[];
+  },
+  input: UpdateBookInput,
+): boolean => {
+  if (input.title !== undefined && input.title !== existingBook.title) {
+    return true;
+  }
+
+  if (input.author !== undefined && input.author !== existingBook.author) {
+    return true;
+  }
+
+  if (
+    input.description !== undefined &&
+    input.description !== existingBook.description
+  ) {
+    return true;
+  }
+
+  if (input.genreSlugs !== undefined) {
+    const existingSlugs = new Set(existingBook.genres.map((g) => g.slug));
+    const nextSlugs = new Set(input.genreSlugs);
+    if (
+      existingSlugs.size !== nextSlugs.size ||
+      [...nextSlugs].some((slug) => !existingSlugs.has(slug))
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
+export const updateBook = async (
+  id: string,
+  input: UpdateBookInput,
+  deps?: UpdateBookDeps,
+): Promise<BookWithGenres | null> => {
+  const db: NonNullable<UpdateBookDeps["prisma"]> = deps?.prisma ?? prisma;
+  const genEmbedding = deps?.generateEmbedding ?? generateEmbedding;
+  const persistEmbedding =
+    deps?.saveBookEmbedding ??
+    ((bookId: string, embedding: number[]) =>
+      saveBookEmbedding(bookId, embedding, {
+        prisma: {
+          $executeRaw: db.$executeRaw
+            ? db.$executeRaw.bind(db)
+            : prisma.$executeRaw.bind(prisma),
+        },
+      }));
+
+  const existingBook = await db.book.findUnique({
     where: { id },
     include: { genres: true },
   });
@@ -240,16 +360,19 @@ export const updateBook = async (id: string, input: UpdateBookInput) => {
 
   const { genreSlugs, ...data } = input;
 
-  let genresToConnect = existingBook.genres;
-  if (genreSlugs !== undefined) {
-    if (genreSlugs.length > 0) {
-      const existingGenres = await prisma.genre.findMany({
-        where: { slug: { in: genreSlugs } },
+  let genresToConnect: { slug: string; name: string }[] = existingBook.genres;
+  const uniqueGenreSlugs =
+    genreSlugs !== undefined ? [...new Set(genreSlugs)] : undefined;
+
+  if (uniqueGenreSlugs !== undefined) {
+    if (uniqueGenreSlugs.length > 0) {
+      const existingGenres = await db.genre.findMany({
+        where: { slug: { in: uniqueGenreSlugs } },
       });
 
-      if (existingGenres.length !== genreSlugs.length) {
+      if (existingGenres.length !== uniqueGenreSlugs.length) {
         const foundSlugs = new Set(existingGenres.map((g) => g.slug));
-        const missing = genreSlugs.filter((s) => !foundSlugs.has(s));
+        const missing = uniqueGenreSlugs.filter((s) => !foundSlugs.has(s));
         throw new Error(`Genre(s) not found: ${missing.join(", ")}`);
       }
       genresToConnect = existingGenres;
@@ -258,21 +381,28 @@ export const updateBook = async (id: string, input: UpdateBookInput) => {
     }
   }
 
-  const newTitle = data.title ?? existingBook.title;
-  const newAuthor = data.author ?? existingBook.author;
-  const newDescription =
-    data.description !== undefined ? data.description : existingBook.description;
+  const shouldRegenerateEmbedding = hasIndexableBookChanges(existingBook, input);
 
-  const searchableText = buildSearchableText({
-    title: newTitle,
-    author: newAuthor,
-    description: newDescription,
-    genres: genresToConnect,
-  });
+  let embedding: number[] | null = null;
+  if (shouldRegenerateEmbedding) {
+    const newTitle = data.title ?? existingBook.title;
+    const newAuthor = data.author ?? existingBook.author;
+    const newDescription =
+      data.description !== undefined
+        ? data.description
+        : existingBook.description;
 
-  const embedding = await generateEmbedding(searchableText);
+    const searchableText = buildSearchableText({
+      title: newTitle,
+      author: newAuthor,
+      description: newDescription,
+      genres: genresToConnect,
+    });
 
-  const updatedBook = await prisma.book.update({
+    embedding = await genEmbedding(searchableText);
+  }
+
+  const updatedBook = await db.book.update({
     where: { id },
     data: {
       ...(data.title !== undefined && { title: data.title }),
@@ -281,9 +411,9 @@ export const updateBook = async (id: string, input: UpdateBookInput) => {
       ...(data.coverUrl !== undefined && { coverUrl: data.coverUrl }),
       ...(data.rating !== undefined && { rating: data.rating }),
       ...(data.publishedAt !== undefined && { publishedAt: data.publishedAt }),
-      ...(genreSlugs !== undefined && {
+      ...(uniqueGenreSlugs !== undefined && {
         genres: {
-          set: genreSlugs.map((slug) => ({ slug })),
+          set: uniqueGenreSlugs.map((slug) => ({ slug })),
         },
       }),
     },
@@ -292,7 +422,9 @@ export const updateBook = async (id: string, input: UpdateBookInput) => {
     },
   });
 
-  await saveBookEmbedding(id, embedding);
+  if (embedding) {
+    await persistEmbedding(id, embedding);
+  }
 
   return updatedBook;
 };
@@ -366,13 +498,37 @@ export const reindexBooks = async (mode: "missing" | "all" = "missing") => {
   return books.length;
 };
 
-export async function searchSimilarBooks(query: string, limit = 5) {
-  const queryEmbedding = await generateEmbedding(query);
+export const DEFAULT_MIN_SIMILARITY = 0.25;
 
-  return findSimilarBooks(queryEmbedding, limit);
+export interface SearchSimilarBooksDeps {
+  generateEmbedding?: typeof generateEmbedding;
+  findSimilarBooks?: typeof findSimilarBooks;
 }
 
-type SimilarBook = {
+export async function searchSimilarBooks(
+  query: string,
+  limit = 5,
+  minSimilarity = DEFAULT_MIN_SIMILARITY,
+  deps?: SearchSimilarBooksDeps,
+): Promise<SimilarBook[]> {
+  if (
+    !Number.isFinite(minSimilarity) ||
+    minSimilarity < 0 ||
+    minSimilarity > 1
+  ) {
+    throw new RangeError("minSimilarity must be between 0 and 1");
+  }
+
+  const genEmbedding = deps?.generateEmbedding ?? generateEmbedding;
+  const findSimilar = deps?.findSimilarBooks ?? findSimilarBooks;
+
+  const queryEmbedding = await genEmbedding(query);
+  const results = await findSimilar(queryEmbedding, limit);
+
+  return results.filter((book) => book.similarity >= minSimilarity);
+}
+
+export type SimilarBook = {
   id: string;
   title: string;
   author: string;
@@ -388,34 +544,66 @@ type SimilarBook = {
 export async function findSimilarBooks(
   embedding: number[],
   limit = 5,
+  deps?: {
+    prisma?: {
+      $queryRaw: <T = unknown>(
+        query: TemplateStringsArray,
+        ...values: unknown[]
+      ) => Promise<T>;
+    };
+  },
 ): Promise<SimilarBook[]> {
+  const db = deps?.prisma ?? prisma;
   const vector = `[${embedding.join(",")}]`;
 
-  return prisma.$queryRaw<SimilarBook[]>`
+  return db.$queryRaw<SimilarBook[]>`
+    WITH top_books AS (
+      SELECT
+        b."id",
+        b."title",
+        b."author",
+        b."description",
+        b."coverUrl",
+        b."rating",
+        b."publishedAt",
+        b."createdAt",
+        (
+          1 - (b."embedding" <=> ${vector}::vector)
+        )::double precision AS similarity
+      FROM "books" b
+      WHERE b."embedding" IS NOT NULL
+      ORDER BY b."embedding" <=> ${vector}::vector
+      LIMIT ${limit}
+    )
     SELECT
-      b."id",
-      b."title",
-      b."author",
-      b."description",
-      b."coverUrl",
-      b."rating",
-      b."publishedAt",
-      b."createdAt",
+      tb."id",
+      tb."title",
+      tb."author",
+      tb."description",
+      tb."coverUrl",
+      tb."rating",
+      tb."publishedAt",
+      tb."createdAt",
       COALESCE(
         json_agg(
           json_build_object('slug', g."slug", 'name', g."name")
         ) FILTER (WHERE g."slug" IS NOT NULL),
         '[]'::json
       ) AS "genres",
-      (
-        1 - (b."embedding" <=> ${vector}::vector)
-      )::double precision AS similarity
-    FROM "books" b
-    LEFT JOIN "_BookToGenre" bg ON b."id" = bg."A"
+      tb."similarity"
+    FROM top_books tb
+    LEFT JOIN "_BookToGenre" bg ON tb."id" = bg."A"
     LEFT JOIN "genres" g ON bg."B" = g."slug"
-    WHERE b."embedding" IS NOT NULL
-    GROUP BY b."id"
-    ORDER BY b."embedding" <=> ${vector}::vector
-    LIMIT ${limit}
+    GROUP BY
+      tb."id",
+      tb."title",
+      tb."author",
+      tb."description",
+      tb."coverUrl",
+      tb."rating",
+      tb."publishedAt",
+      tb."createdAt",
+      tb."similarity"
+    ORDER BY tb."similarity" DESC
   `;
 }

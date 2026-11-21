@@ -1,6 +1,6 @@
 import "../test-setup";
 import { describe, expect, it, mock, spyOn } from "bun:test";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ChatDrawer } from "./chat-drawer";
 import * as chatService from "@/services/chat";
 
@@ -67,7 +67,7 @@ describe("ChatDrawer Component", () => {
   });
 
   it("sends message to API, shows user bubble, typing indicator, and then assistant reply", async () => {
-    const sendSpy = spyOn(chatService, "sendChatMessage").mockImplementation(
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
       () =>
         new Promise((resolve) => {
           setTimeout(
@@ -131,7 +131,7 @@ describe("ChatDrawer Component", () => {
       genres: [{ slug: "sci-fi", name: "Ficção Científica" }],
     };
 
-    const sendSpy = spyOn(chatService, "sendChatMessage").mockResolvedValueOnce({
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockResolvedValueOnce({
       data: {
         userMessage: "Recomende Duna",
         modelReply: "Duna é uma obra-prima de Frank Herbert.",
@@ -176,7 +176,7 @@ describe("ChatDrawer Component", () => {
   });
 
   it("renders markdown formatting with strong tags and bullet points in assistant reply", async () => {
-    const sendSpy = spyOn(chatService, "sendChatMessage").mockResolvedValue({
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockResolvedValue({
       data: {
         userMessage: "Indique",
         modelReply:
@@ -210,7 +210,7 @@ describe("ChatDrawer Component", () => {
 
   it("displays error banner with retry button when API fails and successfully retries", async () => {
     let callCount = 0;
-    const sendSpy = spyOn(chatService, "sendChatMessage").mockImplementation(
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
       async () => {
         callCount++;
         if (callCount === 1) {
@@ -262,19 +262,10 @@ describe("ChatDrawer Component", () => {
     sendSpy.mockRestore();
   });
 
-  it("extracts custom API error message from Axios response", async () => {
-    const axiosError = {
-      isAxiosError: true,
-      response: {
-        data: {
-          message: "Rate limit excedido. Aguarde 1 minuto.",
-        },
-      },
-    };
-
-    const sendSpy = spyOn(chatService, "sendChatMessage").mockRejectedValueOnce(
-      axiosError
-    );
+  it("extracts Error message from streamChatMessage and falls back for non-Error rejections", async () => {
+    const sendSpy = spyOn(chatService, "streamChatMessage")
+      .mockRejectedValueOnce(new Error("Rate limit excedido. Aguarde 1 minuto."))
+      .mockRejectedValueOnce("unexpected string rejection");
 
     render(<ChatDrawer isOpen={true} onClose={() => {}} />);
 
@@ -286,7 +277,15 @@ describe("ChatDrawer Component", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText(/Rate limit excedido\. Aguarde 1 minuto\./i)
+        screen.getByText(/Rate limit excedido\. Aguarde 1 minuto\./i),
+      ).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Tentar novamente" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Ocorreu um erro ao comunicar com o assistente."),
       ).toBeDefined();
     });
 
@@ -338,7 +337,7 @@ describe("ChatDrawer Component", () => {
   });
 
   it("keeps input enabled while loading, blocks Enter submit, and cancels request via stop button with feedback", async () => {
-    const sendSpy = spyOn(chatService, "sendChatMessage").mockImplementation(
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
       (_params, options) =>
         new Promise((_resolve, reject) => {
           options?.signal?.addEventListener("abort", () => {
@@ -384,5 +383,555 @@ describe("ChatDrawer Component", () => {
     expect(input.value).toBe("Próxima pergunta");
 
     sendSpy.mockRestore();
+  });
+
+  it("hides TypingIndicator on 1st delta, renders progressive tokens with smooth fade-in, scrolls smoothly, and renders AiCitationCards on done", async () => {
+    const scrollIntoViewMock = mock();
+    const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scrollIntoViewMock;
+
+    let emitDelta: ((delta: string) => void) | undefined;
+    let finishStream!: (res: Awaited<ReturnType<typeof chatService.streamChatMessage>>) => void;
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
+      (_params, options) => {
+        emitDelta = options?.onDelta;
+        return new Promise((resolve) => {
+          finishStream = resolve;
+        });
+      },
+    );
+
+    try {
+      const onSelectBook = mock();
+      render(
+        <ChatDrawer
+          isOpen={true}
+          onClose={() => {}}
+          onSelectBook={onSelectBook}
+        />,
+      );
+
+      const scrollContainer = screen.getByTestId("chat-scroll-container");
+      let mockScrollHeight = 500;
+      let mockScrollTop = 0;
+      Object.defineProperty(scrollContainer, "clientHeight", {
+        configurable: true,
+        value: 300,
+      });
+      Object.defineProperty(scrollContainer, "scrollHeight", {
+        configurable: true,
+        get: () => mockScrollHeight,
+      });
+      Object.defineProperty(scrollContainer, "scrollTop", {
+        configurable: true,
+        get: () => mockScrollTop,
+        set: (value: number) => {
+          mockScrollTop = value;
+        },
+      });
+
+      const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+      fireEvent.change(input, { target: { value: "Recomende Solaris" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+      // Before 1st token: TypingIndicator visible, streaming bubble absent, smooth scroll ran
+      expect(screen.getByRole("status")).toBeDefined();
+      expect(document.querySelector("[aria-busy='true']")).toBeNull();
+      expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(0);
+      expect(scrollIntoViewMock).toHaveBeenCalledWith({ behavior: "smooth" });
+      const scrollCallsBeforeStream = scrollIntoViewMock.mock.calls.length;
+
+      // 1st token arrives: syncs scrollTop via rAF without restarting smooth scroll
+      await act(async () => {
+        emitDelta?.("Recomendo ");
+      });
+      await waitFor(() => {
+        expect(screen.queryByRole("status")).toBeNull();
+        expect(document.querySelector("[aria-busy='true']")).not.toBeNull();
+        expect(scrollContainer.scrollTop).toBe(500);
+      });
+      expect(screen.queryByTestId("streaming-cursor")).toBeNull();
+      expect(document.querySelectorAll(".animate-chat-token-fade").length).toBeGreaterThan(0);
+      expect(screen.getByText("Recomendo")).toBeDefined();
+      expect(scrollIntoViewMock.mock.calls.length).toBe(scrollCallsBeforeStream);
+
+      // 2nd token arrives with taller content: updates scrollTop without scrollIntoView
+      mockScrollHeight = 620;
+      await act(async () => {
+        emitDelta?.("**Solaris**.");
+      });
+      await waitFor(() => {
+        expect(screen.getByText("Solaris")).toBeDefined();
+        expect(scrollContainer.scrollTop).toBe(620);
+      });
+      expect(scrollIntoViewMock.mock.calls.length).toBe(scrollCallsBeforeStream);
+      expect(document.querySelector("[aria-busy='true']")).not.toBeNull();
+      expect(document.querySelectorAll(".animate-chat-token-fade").length).toBeGreaterThan(1);
+      expect(
+        screen.queryByRole("button", { name: "Ver detalhes do livro Solaris" }),
+      ).toBeNull();
+
+      // Final done event triggers smooth scroll once cards arrive
+      await act(async () => {
+        finishStream({
+          data: {
+            userMessage: "Recomende Solaris",
+            modelReply: "Recomendo **Solaris**.",
+            books: [
+              {
+                id: "sol-1",
+                title: "Solaris",
+                author: "Stanislaw Lem",
+                similarity: 92,
+                genres: [{ slug: "sci-fi", name: "Ficção Científica" }],
+              },
+            ],
+          },
+          meta: {
+            usage: { promptTokens: 50, completionTokens: 10, totalTokens: 60 },
+          },
+        });
+      });
+
+      await waitFor(() => {
+        expect(document.querySelector("[aria-busy='true']")).toBeNull();
+        expect(scrollIntoViewMock.mock.calls.length).toBeGreaterThan(
+          scrollCallsBeforeStream,
+        );
+      });
+      expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(0);
+
+      const citationBtn = screen.getByRole("button", {
+        name: "Ver detalhes do livro Solaris",
+      });
+      expect(citationBtn).toBeDefined();
+      fireEvent.click(citationBtn);
+      expect(onSelectBook).toHaveBeenCalledTimes(1);
+    } finally {
+      HTMLElement.prototype.scrollIntoView = originalScrollIntoView;
+      sendSpy.mockRestore();
+    }
+  });
+
+  it("does not force scroll to bottom while user has scrolled up during streaming", async () => {
+    let emitDelta: ((delta: string) => void) | undefined;
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
+      (_params, options) => {
+        emitDelta = options?.onDelta;
+        return new Promise(() => {});
+      },
+    );
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const scrollContainer = screen.getByTestId("chat-scroll-container");
+    let mockScrollHeight = 600;
+    let mockScrollTop = 0;
+    Object.defineProperty(scrollContainer, "clientHeight", {
+      configurable: true,
+      value: 200,
+    });
+    Object.defineProperty(scrollContainer, "scrollHeight", {
+      configurable: true,
+      get: () => mockScrollHeight,
+    });
+    Object.defineProperty(scrollContainer, "scrollTop", {
+      configurable: true,
+      get: () => mockScrollTop,
+      set: (value: number) => {
+        mockScrollTop = value;
+      },
+    });
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Teste scroll manual" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+    await act(async () => {
+      emitDelta?.("Primeiro trecho ");
+    });
+    await waitFor(() => {
+      expect(scrollContainer.scrollTop).toBe(600);
+    });
+
+    // User scrolls up well above bottom threshold (600 - 100 - 200 = 300 > 80)
+    scrollContainer.scrollTop = 100;
+    fireEvent.scroll(scrollContainer);
+
+    mockScrollHeight = 760;
+    await act(async () => {
+      emitDelta?.("segundo trecho chegando");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(scrollContainer.scrollTop).toBe(100);
+
+    sendSpy.mockRestore();
+  });
+
+  it("preserves partial text and clears streaming state without error banner when stopped mid-stream", async () => {
+    let emitDelta: ((delta: string) => void) | undefined;
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
+      (_params, options) => {
+        emitDelta = options?.onDelta;
+        return new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+      },
+    );
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Explique Duna" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+    await act(async () => {
+      emitDelta?.("Duna é um clássico ");
+      emitDelta?.("sobre ecologia");
+    });
+
+    await waitFor(() => {
+      const busyBubble = document.querySelector("[aria-busy='true']");
+      expect(busyBubble).not.toBeNull();
+      expect(busyBubble?.textContent).toMatch(/Duna é um clássico sobre ecologia/i);
+    });
+    expect(document.querySelectorAll(".animate-chat-token-fade").length).toBeGreaterThan(0);
+
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Interromper resposta" }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector("[aria-busy='true']")).toBeNull();
+    });
+    expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(0);
+
+    expect(screen.getByText(/Duna é um clássico sobre ecologia/i)).toBeDefined();
+    expect(screen.queryByText("Solicitação encerrada.")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    sendSpy.mockRestore();
+  });
+
+  it("handles mid-stream error by clearing streaming state, showing error banner, and retrying cleanly", async () => {
+    let attempt = 0;
+    let emitDelta: ((delta: string) => void) | undefined;
+    let rejectFirstStream!: (err: Error) => void;
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
+      (_params, options) => {
+        attempt += 1;
+        if (attempt === 1) {
+          emitDelta = options?.onDelta;
+          return new Promise((_resolve, reject) => {
+            rejectFirstStream = reject;
+          });
+        }
+        options?.onDelta?.("Resposta completa após retry.");
+        return Promise.resolve({
+          data: {
+            userMessage: "Teste erro mid-stream",
+            modelReply: "Resposta completa após retry.",
+          },
+          meta: {
+            usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+          },
+        });
+      },
+    );
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Teste erro mid-stream" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+    await act(async () => {
+      emitDelta?.("Fragmento inicial antes da falha");
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector("[aria-busy='true']")).not.toBeNull();
+    });
+
+    await act(async () => {
+      rejectFirstStream(new Error("Erro durante transmissão SSE"));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeDefined();
+      expect(screen.getByText("Erro durante transmissão SSE")).toBeDefined();
+    });
+    expect(document.querySelector("[aria-busy='true']")).toBeNull();
+    expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Tentar novamente" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Resposta completa após retry.")).toBeDefined();
+    });
+    expect(screen.queryByText("Fragmento inicial antes da falha")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    sendSpy.mockRestore();
+  });
+
+  it("aborts active stream when drawer closes mid-stream and clears streaming state", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    let emitDelta: ((delta: string) => void) | undefined;
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
+      (_params, options) => {
+        capturedSignal = options?.signal;
+        emitDelta = options?.onDelta;
+        return new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+      },
+    );
+
+    const { rerender } = render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Teste fechar" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+    await act(async () => {
+      emitDelta?.("Texto parcial antes de fechar");
+    });
+    await waitFor(() => {
+      expect(document.querySelector("[aria-busy='true']")).not.toBeNull();
+    });
+
+    await act(async () => {
+      rerender(<ChatDrawer isOpen={false} onClose={() => {}} />);
+    });
+    expect(capturedSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      rerender(<ChatDrawer isOpen={true} onClose={() => {}} />);
+    });
+    await waitFor(() => {
+      expect(document.querySelector("[aria-busy='true']")).toBeNull();
+    });
+    expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(0);
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    sendSpy.mockRestore();
+  });
+
+  it("clears fade-in state and aria-busy if signal aborts right as streamChatMessage resolves after deltas", async () => {
+    let emitDelta: ((delta: string) => void) | undefined;
+    let resolveStream!: (res: Awaited<ReturnType<typeof chatService.streamChatMessage>>) => void;
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
+      (_params, options) => {
+        emitDelta = options?.onDelta;
+        return new Promise((resolve) => {
+          resolveStream = resolve;
+        });
+      },
+    );
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Race abort" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+    await act(async () => {
+      emitDelta?.("Texto antes da corrida");
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector("[aria-busy='true']")).not.toBeNull();
+      expect(document.querySelectorAll(".animate-chat-token-fade").length).toBeGreaterThan(0);
+    });
+
+    // Abort and resolve simultaneously (abort listener isn't used in mock, simulating resolution race)
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Interromper resposta" }),
+      );
+      resolveStream({
+        data: {
+          userMessage: "Race abort",
+          modelReply: "Texto completo ignorado",
+        },
+        meta: {
+          usage: { promptTokens: 5, completionTokens: 5, totalTokens: 10 },
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector("[aria-busy='true']")).toBeNull();
+    });
+    expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(0);
+    expect(screen.getByText("Texto antes da corrida")).toBeDefined();
+    expect(screen.queryByText("Texto completo ignorado")).toBeNull();
+
+    sendSpy.mockRestore();
+  });
+
+  it("keeps TypingIndicator visible and avoids creating blank bubble on whitespace-only first delta", async () => {
+    let emitDelta: ((delta: string) => void) | undefined;
+    let resolveStream!: (res: Awaited<ReturnType<typeof chatService.streamChatMessage>>) => void;
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementation(
+      (_params, options) => {
+        emitDelta = options?.onDelta;
+        return new Promise((resolve) => {
+          resolveStream = resolve;
+        });
+      },
+    );
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+    fireEvent.change(input, { target: { value: "Espaços iniciais" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+    await act(async () => {
+      emitDelta?.("   ");
+    });
+
+    expect(screen.getByRole("status")).toBeDefined();
+    expect(document.querySelector("[aria-busy='true']")).toBeNull();
+    expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(0);
+
+    await act(async () => {
+      emitDelta?.("Olá leitor!");
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).toBeNull();
+      const busyBubble = document.querySelector("[aria-busy='true']");
+      expect(busyBubble).not.toBeNull();
+      expect(busyBubble?.textContent).toContain("Olá leitor!");
+    });
+    expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(2);
+
+    await act(async () => {
+      resolveStream({
+        data: { userMessage: "Espaços iniciais", modelReply: "Olá leitor!" },
+        meta: {
+          usage: { promptTokens: 5, completionTokens: 5, totalTokens: 10 },
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector("[aria-busy='true']")).toBeNull();
+    });
+    expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(0);
+    expect(screen.getByText("Olá leitor!")).toBeDefined();
+
+    sendSpy.mockRestore();
+  });
+
+  it("restores scroll position to the bottom immediately when closing and reopening the drawer", async () => {
+    const scrollTopByEl = new WeakMap<HTMLElement, number>();
+    const origScrollHeight = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "scrollHeight",
+    );
+    const origScrollTop = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "scrollTop",
+    );
+
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get() {
+        if ((this as HTMLElement).dataset?.testid === "chat-scroll-container") {
+          return 640;
+        }
+        return origScrollHeight?.get ? origScrollHeight.get.call(this) : 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get() {
+        if ((this as HTMLElement).dataset?.testid === "chat-scroll-container") {
+          return scrollTopByEl.get(this as HTMLElement) ?? 0;
+        }
+        return origScrollTop?.get ? origScrollTop.get.call(this) : 0;
+      },
+      set(value: number) {
+        if ((this as HTMLElement).dataset?.testid === "chat-scroll-container") {
+          scrollTopByEl.set(this as HTMLElement, value);
+          return;
+        }
+        origScrollTop?.set?.call(this, value);
+      },
+    });
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockResolvedValueOnce({
+      data: {
+        userMessage: "Pergunta longa",
+        modelReply: "Resposta longa do assistente.",
+      },
+      meta: {
+        usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+      },
+    });
+
+    try {
+      const { rerender } = render(
+        <ChatDrawer isOpen={true} onClose={() => {}} />,
+      );
+
+      const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+      fireEvent.change(input, { target: { value: "Pergunta longa" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("Resposta longa do assistente.")).toBeDefined();
+      });
+
+      await act(async () => {
+        rerender(<ChatDrawer isOpen={false} onClose={() => {}} />);
+      });
+      expect(screen.queryByTestId("chat-scroll-container")).toBeNull();
+
+      await act(async () => {
+        rerender(<ChatDrawer isOpen={true} onClose={() => {}} />);
+      });
+
+      const reopenedContainer = screen.getByTestId("chat-scroll-container");
+      expect(reopenedContainer.scrollTop).toBe(640);
+    } finally {
+      if (origScrollHeight) {
+        Object.defineProperty(
+          HTMLElement.prototype,
+          "scrollHeight",
+          origScrollHeight,
+        );
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, "scrollHeight");
+      }
+      if (origScrollTop) {
+        Object.defineProperty(
+          HTMLElement.prototype,
+          "scrollTop",
+          origScrollTop,
+        );
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, "scrollTop");
+      }
+      sendSpy.mockRestore();
+    }
   });
 });
