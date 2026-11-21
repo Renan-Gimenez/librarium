@@ -385,27 +385,33 @@ describe("App component integration", () => {
 
   it("opens book details modal from AI citation card while keeping assistant drawer open, and closing modal preserves drawer", async () => {
     const chatService = await import("@/services/chat");
-    const sendSpy = spyOn(chatService, "sendChatMessage").mockResolvedValueOnce({
-      data: {
-        userMessage: "Recomende Duna",
-        modelReply: "Duna é fantástico.",
-        books: [
-          {
-            id: "cited-dune-id",
-            title: "Duna Citação",
-            author: "Frank Herbert",
-            description: "Sinopse completa de Duna.",
-            coverUrl: "https://example.com/dune.jpg",
-            rating: 4.9,
-            similarity: 98,
-            genres: [{ slug: "sci-fi", name: "Ficção Científica" }],
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockImplementationOnce(
+      async (_params, options) => {
+        options?.onDelta?.("Duna ");
+        options?.onDelta?.("é fantástico.");
+        return {
+          data: {
+            userMessage: "Recomende Duna",
+            modelReply: "Duna é fantástico.",
+            books: [
+              {
+                id: "cited-dune-id",
+                title: "Duna Citação",
+                author: "Frank Herbert",
+                description: "Sinopse completa de Duna.",
+                coverUrl: "https://example.com/dune.jpg",
+                rating: 4.9,
+                similarity: 98,
+                genres: [{ slug: "sci-fi", name: "Ficção Científica" }],
+              },
+            ],
           },
-        ],
+          meta: {
+            usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+          },
+        };
       },
-      meta: {
-        usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
-      },
-    });
+    );
 
     renderWithClient(<App />);
 
@@ -423,11 +429,13 @@ describe("App component integration", () => {
     const sendBtn = screen.getByRole("button", { name: "Enviar mensagem" });
     fireEvent.click(sendBtn);
 
-    // Wait for citation card
+    // Wait for citation card and verify streaming state is cleared
     const citationBtn = await screen.findByRole("button", {
       name: "Ver detalhes do livro Duna Citação",
     });
     expect(citationBtn).toBeDefined();
+    expect(document.querySelector("[aria-busy='true']")).toBeNull();
+    expect(document.querySelectorAll(".animate-chat-token-fade").length).toBe(0);
 
     // Click citation card
     fireEvent.click(citationBtn);

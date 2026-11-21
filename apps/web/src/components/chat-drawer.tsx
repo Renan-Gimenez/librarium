@@ -1,5 +1,4 @@
 import * as React from "react";
-import axios from "axios";
 import ReactMarkdown from "react-markdown";
 import { ArrowUp, Sparkles, Square, X } from "lucide-react";
 import {
@@ -10,19 +9,13 @@ import {
   SheetTitle,
 } from "@repo/ui";
 import { useChatSession } from "@/hooks/use-chat-session";
-import { sendChatMessage } from "@/services/chat";
+import { streamChatMessage } from "@/services/chat";
 import { TypingIndicator } from "@/components/typing-indicator";
 import { AiCitationCard } from "@/components/ai-citation-card";
-import type { ApiErrorResponse, Book, ChatMessage } from "@/types/api";
+import type { Book, ChatMessage } from "@/types/api";
 
 function extractErrorMessage(err: unknown): string {
-  if (
-    axios.isAxiosError<ApiErrorResponse>(err) &&
-    err.response?.data?.message
-  ) {
-    return err.response.data.message;
-  }
-  if (err instanceof Error) {
+  if (err instanceof Error && err.message) {
     return err.message;
   }
   return "Ocorreu um erro ao comunicar com o assistente.";
@@ -33,6 +26,128 @@ const PROMPT_STARTERS = [
   "Quais são os livros mais bem avaliados do acervo?",
   "Quero um livro sobre cosmologia e buracos negros",
 ] as const;
+
+function wrapStreamingChildren(children: React.ReactNode): React.ReactNode {
+  return React.Children.map(children, (child, childIndex) => {
+    if (typeof child !== "string") {
+      return child;
+    }
+
+    return child.split(/(\s+)/).map((part, partIndex) => {
+      if (!part) {
+        return null;
+      }
+      if (/^\s+$/.test(part)) {
+        return part;
+      }
+      return (
+        <span
+          key={`${childIndex}-${partIndex}`}
+          className="animate-chat-token-fade"
+        >
+          {part}
+        </span>
+      );
+    });
+  });
+}
+
+const MARKDOWN_COMPONENTS: React.ComponentProps<
+  typeof ReactMarkdown
+>["components"] = {
+  h1: ({ children }) => (
+    <h1 className="mt-3 mb-1.5 first:mt-0 text-[14.5px] font-semibold text-white leading-snug">
+      {children}
+    </h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="mt-3 mb-1.5 first:mt-0 text-[14.5px] font-semibold text-white leading-snug">
+      {children}
+    </h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="mt-3 mb-1.5 first:mt-0 text-[13.5px] font-semibold text-white leading-snug">
+      {children}
+    </h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="mt-3 mb-1.5 first:mt-0 text-[13.5px] font-semibold text-white leading-snug">
+      {children}
+    </h4>
+  ),
+  p: ({ children }) => (
+    <p className="mb-2.5 last:mb-0 leading-[1.5]">{children}</p>
+  ),
+  strong: ({ children }) => (
+    <strong className="font-semibold text-white">{children}</strong>
+  ),
+  em: ({ children }) => (
+    <em className="italic text-[#E4E4E7]">{children}</em>
+  ),
+  ul: ({ children }) => (
+    <ul className="my-2 list-disc pl-4 space-y-1">{children}</ul>
+  ),
+  ol: ({ children }) => (
+    <ol className="my-2 list-decimal pl-4 space-y-1">{children}</ol>
+  ),
+  li: ({ children }) => <li className="leading-relaxed pl-0.5">{children}</li>,
+  code: ({ children }) => (
+    <code className="rounded bg-[#272A34] px-1 py-0.5 font-mono text-[12px] text-[#E4E4E7]">
+      {children}
+    </code>
+  ),
+};
+
+const STREAMING_MARKDOWN_COMPONENTS: React.ComponentProps<
+  typeof ReactMarkdown
+>["components"] = {
+  ...MARKDOWN_COMPONENTS,
+  h1: ({ children }) => (
+    <h1 className="mt-3 mb-1.5 first:mt-0 text-[14.5px] font-semibold text-white leading-snug">
+      {wrapStreamingChildren(children)}
+    </h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="mt-3 mb-1.5 first:mt-0 text-[14.5px] font-semibold text-white leading-snug">
+      {wrapStreamingChildren(children)}
+    </h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="mt-3 mb-1.5 first:mt-0 text-[13.5px] font-semibold text-white leading-snug">
+      {wrapStreamingChildren(children)}
+    </h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="mt-3 mb-1.5 first:mt-0 text-[13.5px] font-semibold text-white leading-snug">
+      {wrapStreamingChildren(children)}
+    </h4>
+  ),
+  p: ({ children }) => (
+    <p className="mb-2.5 last:mb-0 leading-[1.5]">
+      {wrapStreamingChildren(children)}
+    </p>
+  ),
+  strong: ({ children }) => (
+    <strong className="font-semibold text-white">
+      {wrapStreamingChildren(children)}
+    </strong>
+  ),
+  em: ({ children }) => (
+    <em className="italic text-[#E4E4E7]">
+      {wrapStreamingChildren(children)}
+    </em>
+  ),
+  li: ({ children }) => (
+    <li className="leading-relaxed pl-0.5">
+      {wrapStreamingChildren(children)}
+    </li>
+  ),
+  code: ({ children }) => (
+    <code className="rounded bg-[#272A34] px-1 py-0.5 font-mono text-[12px] text-[#E4E4E7]">
+      {wrapStreamingChildren(children)}
+    </code>
+  ),
+};
 
 export interface ChatDrawerProps {
   isOpen: boolean;
@@ -55,9 +170,16 @@ export function ChatDrawer({
   const [error, setError] = React.useState<string | null>(null);
 
   const inputRef = React.useRef<HTMLInputElement>(null);
+  const scrollContainerRef = React.useRef<HTMLDivElement>(null);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const abortControllerRef = React.useRef<AbortController | null>(null);
   const cancelledByUserRef = React.useRef(false);
+  const failedStreamingMessageIdRef = React.useRef<string | null>(null);
+  const focusTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isUserNearBottomRef = React.useRef(true);
+  const scrollCancelRef = React.useRef<(() => void) | null>(null);
+  const isOpenRef = React.useRef(isOpen);
+  const msgSeqRef = React.useRef(0);
 
   // Sync state with prop change without setState in useEffect
   if (initialPrompt !== prevPrompt) {
@@ -65,36 +187,99 @@ export function ChatDrawer({
     setInputValue(initialPrompt);
   }
 
-  const scrollToBottom = React.useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  const clearFocusTimer = React.useCallback(() => {
+    if (focusTimerRef.current !== null) {
+      clearTimeout(focusTimerRef.current);
+      focusTimerRef.current = null;
+    }
   }, []);
 
-  React.useEffect(() => {
-    scrollToBottom();
-  }, [messages, isLoading, error, scrollToBottom]);
+  const cancelScheduledScroll = React.useCallback(() => {
+    if (scrollCancelRef.current) {
+      scrollCancelRef.current();
+      scrollCancelRef.current = null;
+    }
+  }, []);
 
-  // Touch session and focus input when drawer opens
+  const handleBodyScroll = React.useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isUserNearBottomRef.current = distanceFromBottom <= 80;
+  }, []);
+
+  const isStreamingMessage = messages.some((m) => m.isStreaming);
+
   React.useEffect(() => {
+    return () => cancelScheduledScroll();
+  }, [cancelScheduledScroll]);
+
+  React.useLayoutEffect(() => {
+    if (!isOpen) return;
+    isUserNearBottomRef.current = true;
+    const el = scrollContainerRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [isOpen]);
+
+  React.useEffect(() => {
+    if (!isUserNearBottomRef.current) {
+      return;
+    }
+
+    if (isStreamingMessage) {
+      if (!scrollCancelRef.current) {
+        const syncScroll = () => {
+          scrollCancelRef.current = null;
+          const el = scrollContainerRef.current;
+          if (el && isUserNearBottomRef.current) {
+            el.scrollTop = el.scrollHeight;
+          }
+        };
+
+        if (typeof requestAnimationFrame === "function") {
+          const rafId = requestAnimationFrame(syncScroll);
+          scrollCancelRef.current = () => cancelAnimationFrame(rafId);
+        } else {
+          const timer = setTimeout(syncScroll, 0);
+          scrollCancelRef.current = () => clearTimeout(timer);
+        }
+      }
+      return;
+    }
+
+    cancelScheduledScroll();
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isLoading, error, isStreamingMessage, cancelScheduledScroll]);
+
+  // Keep isOpenRef synchronized, touch session and focus input when drawer opens
+  React.useEffect(() => {
+    isOpenRef.current = isOpen;
     if (isOpen) {
       touchSession();
       const timer = setTimeout(() => {
-        inputRef.current?.focus();
+        if (isOpenRef.current) {
+          inputRef.current?.focus();
+        }
       }, 100);
       return () => clearTimeout(timer);
     }
   }, [isOpen, touchSession]);
 
-  // Abort pending request when drawer closes or unmounts
+  // Abort pending request and clear focus timer when drawer closes or unmounts
   React.useEffect(() => {
     if (!isOpen) {
+      clearFocusTimer();
       cancelledByUserRef.current = false;
       abortControllerRef.current?.abort();
     }
     return () => {
+      clearFocusTimer();
       cancelledByUserRef.current = false;
       abortControllerRef.current?.abort();
     };
-  }, [isOpen]);
+  }, [isOpen, clearFocusTimer]);
 
   const handleStopGeneration = () => {
     if (!isLoading) return;
@@ -112,14 +297,20 @@ export function ChatDrawer({
     if (!trimmed || isLoading) return;
 
     touchSession();
+    isUserNearBottomRef.current = true;
     if (!isRetry) {
       setInputValue("");
     }
     setError(null);
 
-    if (!isRetry) {
+    if (isRetry && failedStreamingMessageIdRef.current) {
+      const failedId = failedStreamingMessageIdRef.current;
+      failedStreamingMessageIdRef.current = null;
+      setMessages((prev) => prev.filter((m) => m.id !== failedId));
+    } else if (!isRetry) {
+      failedStreamingMessageIdRef.current = null;
       const userMessage: ChatMessage = {
-        id: `user-${Date.now()}`,
+        id: `user-${Date.now()}-${++msgSeqRef.current}`,
         role: "user",
         content: trimmed,
         createdAt: new Date().toISOString(),
@@ -131,57 +322,154 @@ export function ChatDrawer({
 
     cancelledByUserRef.current = false;
     abortControllerRef.current?.abort();
-    abortControllerRef.current = new AbortController();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    const assistantMsgId = `assistant-${Date.now()}-${++msgSeqRef.current}`;
+    let hasReceivedDelta = false;
+
+    const handleAbortedStream = () => {
+      const isCurrentController = abortControllerRef.current === controller;
+      if (hasReceivedDelta) {
+        if (isCurrentController) {
+          cancelledByUserRef.current = false;
+        }
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId ? { ...m, isStreaming: false } : m,
+          ),
+        );
+      } else if (isCurrentController && cancelledByUserRef.current) {
+        cancelledByUserRef.current = false;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `cancelled-${Date.now()}-${++msgSeqRef.current}`,
+            role: "assistant",
+            content: "Solicitação encerrada.",
+            isCancelled: true,
+            createdAt: new Date().toISOString(),
+          },
+        ]);
+      }
+    };
 
     try {
-      const response = await sendChatMessage(
+      const response = await streamChatMessage(
         {
           message: trimmed,
           sessionId,
         },
-        { signal: abortControllerRef.current.signal }
+        {
+          signal: controller.signal,
+          onDelta: (deltaContent) => {
+            if (controller.signal.aborted || !deltaContent) {
+              return;
+            }
+
+            if (!hasReceivedDelta) {
+              if (!deltaContent.trim()) {
+                return;
+              }
+              hasReceivedDelta = true;
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: assistantMsgId,
+                  role: "assistant",
+                  content: deltaContent,
+                  isStreaming: true,
+                  createdAt: new Date().toISOString(),
+                },
+              ]);
+              return;
+            }
+
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantMsgId
+                  ? { ...m, content: `${m.content}${deltaContent}` }
+                  : m,
+              ),
+            );
+          },
+        },
       );
+
+      if (controller.signal.aborted) {
+        handleAbortedStream();
+        return;
+      }
 
       const replyContent =
         response.data.modelReply?.trim() ||
         "Não consegui formular uma recomendação para este pedido. Poderia reformular a pergunta?";
 
-      const assistantMessage: ChatMessage = {
-        id: `assistant-${Date.now()}`,
-        role: "assistant",
-        content: replyContent,
-        books: response.data.books,
-        createdAt: new Date().toISOString(),
-      };
-
-      setMessages((prev) => [...prev, assistantMessage]);
+      setMessages((prev) => {
+        const exists = prev.some((m) => m.id === assistantMsgId);
+        if (exists) {
+          return prev.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  content: replyContent,
+                  books: response.data.books,
+                  isStreaming: false,
+                }
+              : m,
+          );
+        }
+        return [
+          ...prev,
+          {
+            id: assistantMsgId,
+            role: "assistant",
+            content: replyContent,
+            books: response.data.books,
+            isStreaming: false,
+            createdAt: new Date().toISOString(),
+          },
+        ];
+      });
       touchSession();
     } catch (err: unknown) {
-      if (
-        axios.isCancel(err) ||
-        (err instanceof Error && err.name === "AbortError")
-      ) {
-        if (cancelledByUserRef.current) {
-          cancelledByUserRef.current = false;
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `cancelled-${Date.now()}`,
-              role: "assistant",
-              content: "Solicitação encerrada.",
-              isCancelled: true,
-              createdAt: new Date().toISOString(),
-            },
-          ]);
-        }
+      const isAborted =
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError");
+
+      if (isAborted) {
+        handleAbortedStream();
         return;
       }
-      setError(extractErrorMessage(err));
+
+      const isCurrentController = abortControllerRef.current === controller;
+      if (hasReceivedDelta) {
+        if (isCurrentController) {
+          failedStreamingMessageIdRef.current = assistantMsgId;
+        }
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId ? { ...m, isStreaming: false } : m,
+          ),
+        );
+      }
+
+      if (isCurrentController) {
+        setError(extractErrorMessage(err));
+      }
     } finally {
-      setIsLoading(false);
-      setTimeout(() => {
-        inputRef.current?.focus();
-      }, 50);
+      if (abortControllerRef.current === controller) {
+        setIsLoading(false);
+        clearFocusTimer();
+        if (isOpenRef.current) {
+          focusTimerRef.current = setTimeout(() => {
+            focusTimerRef.current = null;
+            if (isOpenRef.current) {
+              inputRef.current?.focus();
+            }
+          }, 50);
+        }
+      }
     }
   };
 
@@ -239,7 +527,12 @@ export function ChatDrawer({
         </SheetHeader>
 
         {/* Chat Body (Scrollable) */}
-        <div className="flex flex-1 min-h-0 flex-col gap-4 overflow-y-auto p-4 sm:p-6">
+        <div
+          ref={scrollContainerRef}
+          data-testid="chat-scroll-container"
+          onScroll={handleBodyScroll}
+          className="flex flex-1 min-h-0 flex-col gap-4 overflow-y-auto p-4 sm:p-6"
+        >
           {/* Welcome Message Bubble */}
           <div className="rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-4 shadow-sm">
             <p className="font-ui text-[13.5px] leading-[1.55] text-[#F4F4F6]">
@@ -303,58 +596,46 @@ export function ChatDrawer({
                 <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#7C3AED] text-white mt-0.5">
                   <Sparkles className="h-[13px] w-[13px]" aria-hidden="true" />
                 </div>
-                <div className="flex flex-1 flex-col gap-2.5 rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-3.5 shadow-sm">
-                  <div className="font-ui text-[13.5px] leading-[1.5] text-[#F4F4F6] break-words [overflow-wrap:anywhere]">
+                <div
+                  aria-busy={message.isStreaming ? "true" : undefined}
+                  className="flex flex-1 flex-col gap-2.5 rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-3.5 shadow-sm"
+                >
+                  <div
+                    aria-live="polite"
+                    className="font-ui text-[13.5px] leading-[1.5] text-[#F4F4F6] break-words [overflow-wrap:anywhere]"
+                  >
                     <ReactMarkdown
-                      components={{
-                        p: ({ children }) => (
-                          <p className="mb-2.5 last:mb-0 leading-[1.5]">{children}</p>
-                        ),
-                        strong: ({ children }) => (
-                          <strong className="font-semibold text-white">{children}</strong>
-                        ),
-                        em: ({ children }) => (
-                          <em className="italic text-[#E4E4E7]">{children}</em>
-                        ),
-                        ul: ({ children }) => (
-                          <ul className="my-2 list-disc pl-4 space-y-1">{children}</ul>
-                        ),
-                        ol: ({ children }) => (
-                          <ol className="my-2 list-decimal pl-4 space-y-1">{children}</ol>
-                        ),
-                        li: ({ children }) => (
-                          <li className="leading-relaxed pl-0.5">{children}</li>
-                        ),
-                        code: ({ children }) => (
-                          <code className="rounded bg-[#272A34] px-1 py-0.5 font-mono text-[12px] text-[#E4E4E7]">
-                            {children}
-                          </code>
-                        ),
-                      }}
+                      components={
+                        message.isStreaming
+                          ? STREAMING_MARKDOWN_COMPONENTS
+                          : MARKDOWN_COMPONENTS
+                      }
                     >
                       {message.content}
                     </ReactMarkdown>
                   </div>
 
                   {/* Rich Cited Book Cards */}
-                  {message.books && message.books.length > 0 && (
-                    <div className="flex flex-col gap-2 pt-2.5 border-t border-[#272A34]/60">
-                      {message.books.map((citedBook) => (
-                        <AiCitationCard
-                          key={citedBook.id}
-                          book={citedBook}
-                          onSelect={onSelectBook}
-                        />
-                      ))}
-                    </div>
-                  )}
+                  {!message.isStreaming &&
+                    message.books &&
+                    message.books.length > 0 && (
+                      <div className="flex flex-col gap-2 pt-2.5 border-t border-[#272A34]/60">
+                        {message.books.map((citedBook) => (
+                          <AiCitationCard
+                            key={citedBook.id}
+                            book={citedBook}
+                            onSelect={onSelectBook}
+                          />
+                        ))}
+                      </div>
+                    )}
                 </div>
               </div>
             );
           })}
 
-          {/* Typing Indicator while waiting for response */}
-          {isLoading && (
+          {/* Typing Indicator while waiting for first streamed token */}
+          {isLoading && !isStreamingMessage && (
             <div className="flex items-start gap-2.5">
               <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#7C3AED] text-white mt-0.5">
                 <Sparkles className="h-[13px] w-[13px]" aria-hidden="true" />

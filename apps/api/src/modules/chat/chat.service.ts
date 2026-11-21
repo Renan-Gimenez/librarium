@@ -1,7 +1,10 @@
 import type {
   ChatCompletion,
+  ChatCompletionChunk,
   ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
   ChatCompletionMessageParam,
+  ChatCompletionMessageToolCall,
 } from "openai/resources/chat/completions";
 
 import { env } from "@/config/env";
@@ -52,6 +55,11 @@ export interface ProcessChatMessageInput {
   message: string;
 }
 
+export interface StreamChatMessageInput extends ProcessChatMessageInput {
+  signal?: AbortSignal;
+  onDelta?: (content: string) => void;
+}
+
 export interface ProcessChatMessageResult {
   data: {
     userMessage: string;
@@ -63,7 +71,7 @@ export interface ProcessChatMessageResult {
   };
 }
 
-export interface ChatServiceDeps {
+export interface ChatServiceBaseDeps {
   prisma?: {
     genre: {
       findMany: (args?: {
@@ -81,6 +89,14 @@ export interface ChatServiceDeps {
       seconds: number,
     ) => Promise<unknown>;
   };
+  executeToolCall?: typeof executeChatToolCall;
+  toolDeps?: ChatToolsDeps;
+  sessionTtl?: number;
+  now?: () => Date;
+  generateId?: () => string;
+}
+
+export interface ChatServiceDeps extends ChatServiceBaseDeps {
   openai?: {
     chat: {
       completions: {
@@ -90,11 +106,19 @@ export interface ChatServiceDeps {
       };
     };
   };
-  executeToolCall?: typeof executeChatToolCall;
-  toolDeps?: ChatToolsDeps;
-  sessionTtl?: number;
-  now?: () => Date;
-  generateId?: () => string;
+}
+
+export interface ChatStreamServiceDeps extends ChatServiceBaseDeps {
+  openai?: {
+    chat: {
+      completions: {
+        create: (
+          body: ChatCompletionCreateParamsStreaming,
+          options?: { signal?: AbortSignal },
+        ) => Promise<AsyncIterable<ChatCompletionChunk>>;
+      };
+    };
+  };
 }
 
 const COMPLETION_BASE_PARAMS = {
@@ -225,21 +249,76 @@ function accumulateUsage(
   total.totalTokens += usage.total_tokens ?? 0;
 }
 
-export async function processChatMessage(
+function createAbortError(signal?: AbortSignal): Error {
+  if (signal?.reason instanceof Error) {
+    return signal.reason;
+  }
+  return new DOMException("The operation was aborted.", "AbortError");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createAbortError(signal);
+  }
+}
+
+async function raceWithSignal<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) {
+    return promise;
+  }
+  throwIfAborted(signal);
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(createAbortError(signal));
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+interface PreparedChatContext {
+  normalizedToken: string;
+  redisKey: string;
+  redisClient: NonNullable<ChatServiceBaseDeps["redis"]>;
+  runToolCall: typeof executeChatToolCall;
+  sessionTtl: number;
+  now: () => Date;
+  generateId: () => string;
+  messageHistory: StoredChatMessage[];
+  messages: ChatCompletionMessageParam[];
+}
+
+async function prepareChatContext(
   input: ProcessChatMessageInput,
-  deps?: ChatServiceDeps,
-): Promise<ProcessChatMessageResult> {
+  deps?: ChatServiceBaseDeps,
+  signal?: AbortSignal,
+): Promise<PreparedChatContext> {
   const { token, message } = input;
   const normalizedToken = token.trim();
   if (!normalizedToken) {
     throw new Error("Session token is required");
   }
 
-  const db: NonNullable<ChatServiceDeps["prisma"]> = deps?.prisma ?? prisma;
-  const redisClient: NonNullable<ChatServiceDeps["redis"]> =
+  throwIfAborted(signal);
+
+  const db: NonNullable<ChatServiceBaseDeps["prisma"]> = deps?.prisma ?? prisma;
+  const redisClient: NonNullable<ChatServiceBaseDeps["redis"]> =
     deps?.redis ?? redis;
-  const openaiClient: NonNullable<ChatServiceDeps["openai"]> =
-    deps?.openai ?? openai;
   const runToolCall = deps?.executeToolCall ?? executeChatToolCall;
   const sessionTtl = deps?.sessionTtl ?? env.CHAT_SESSION_TTL;
   const now = deps?.now ?? (() => new Date());
@@ -247,13 +326,18 @@ export async function processChatMessage(
 
   const redisKey = `chat:session:${normalizedToken}:messages`;
 
-  const [cachedHistory, genres] = await Promise.all([
-    redisClient.get(redisKey),
-    db.genre.findMany({
-      select: { slug: true, name: true },
-      orderBy: { name: "asc" },
-    }),
-  ]);
+  const [cachedHistory, genres] = await raceWithSignal(
+    Promise.all([
+      redisClient.get(redisKey),
+      db.genre.findMany({
+        select: { slug: true, name: true },
+        orderBy: { name: "asc" },
+      }),
+    ]),
+    signal,
+  );
+
+  throwIfAborted(signal);
 
   const messageHistory = parseStoredHistory(cachedHistory);
 
@@ -272,6 +356,282 @@ export async function processChatMessage(
     },
   ];
 
+  return {
+    normalizedToken,
+    redisKey,
+    redisClient,
+    runToolCall,
+    sessionTtl,
+    now,
+    generateId,
+    messageHistory,
+    messages,
+  };
+}
+
+async function executeAndAppendToolRound(params: {
+  toolCalls: ChatCompletionMessageToolCall[];
+  assistantContent: string | null;
+  messages: ChatCompletionMessageParam[];
+  candidateBooks: Map<string, ToolBookCandidate>;
+  runToolCall: typeof executeChatToolCall;
+  toolDeps?: ChatToolsDeps;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const {
+    toolCalls,
+    assistantContent,
+    messages,
+    candidateBooks,
+    runToolCall,
+    toolDeps,
+    signal,
+  } = params;
+
+  throwIfAborted(signal);
+
+  messages.push({
+    role: "assistant",
+    content: assistantContent,
+    tool_calls: toolCalls,
+  });
+
+  const toolResults = await raceWithSignal(
+    Promise.all(toolCalls.map((toolCall) => runToolCall(toolCall, toolDeps))),
+    signal,
+  );
+
+  throwIfAborted(signal);
+
+  for (const result of toolResults) {
+    for (const book of result.books) {
+      mergeCandidateBook(candidateBooks, book);
+    }
+
+    messages.push({
+      role: "tool",
+      tool_call_id: result.toolCallId,
+      content: result.content,
+    });
+  }
+}
+
+async function finalizeChatResult(params: {
+  context: PreparedChatContext;
+  userInputMessage: string;
+  rawModelReply: string;
+  candidateBooks: Map<string, ToolBookCandidate>;
+  totalUsage: ChatResponseUsage;
+  signal?: AbortSignal;
+  onFallback?: (fallbackReply: string) => void;
+}): Promise<ProcessChatMessageResult> {
+  const {
+    context,
+    userInputMessage,
+    rawModelReply,
+    candidateBooks,
+    totalUsage,
+    signal,
+    onFallback,
+  } = params;
+
+  throwIfAborted(signal);
+
+  let modelReply = rawModelReply;
+  const usedFallback = !modelReply.trim();
+  if (usedFallback) {
+    modelReply = FALLBACK_EMPTY_REPLY;
+  }
+
+  throwIfAborted(signal);
+
+  const userMessage: StoredChatMessage = {
+    id: context.generateId(),
+    role: "user",
+    content: userInputMessage,
+    createdAt: context.now().toISOString(),
+  };
+
+  const assistantMessage: StoredChatMessage = {
+    id: context.generateId(),
+    role: "assistant",
+    content: modelReply,
+    createdAt: context.now().toISOString(),
+  };
+
+  const updatedHistory: StoredChatMessage[] = [
+    ...context.messageHistory,
+    userMessage,
+    assistantMessage,
+  ];
+
+  if (context.sessionTtl > 0) {
+    await raceWithSignal(
+      context.redisClient.set(
+        context.redisKey,
+        JSON.stringify(updatedHistory),
+        "EX",
+        context.sessionTtl,
+      ),
+      signal,
+    );
+    throwIfAborted(signal);
+  }
+
+  if (usedFallback) {
+    onFallback?.(modelReply);
+  }
+
+  const citedBooks = usedFallback
+    ? []
+    : Array.from(candidateBooks.values())
+        .filter((book) => isBookCitedInReply(book.title, modelReply))
+        .map(toCitedBook);
+
+  return {
+    data: {
+      userMessage: userInputMessage,
+      modelReply,
+      books: citedBooks,
+    },
+    meta: {
+      usage: totalUsage,
+    },
+  };
+}
+
+interface AccumulatedToolCall {
+  id: string;
+  type: "function" | "custom";
+  functionName: string;
+  functionArguments: string;
+  customName: string;
+  customInput: string;
+}
+
+interface StreamRoundOutcome {
+  content: string;
+  toolCalls: ChatCompletionMessageToolCall[];
+}
+
+async function consumeCompletionStream(
+  stream: AsyncIterable<ChatCompletionChunk>,
+  totalUsage: ChatResponseUsage,
+  signal?: AbortSignal,
+  onDelta?: (content: string) => void,
+): Promise<StreamRoundOutcome> {
+  let content = "";
+  const toolCallsByIndex = new Map<number, AccumulatedToolCall>();
+  const iterator = stream[Symbol.asyncIterator]();
+  let completed = false;
+
+  try {
+    while (true) {
+      const step = await raceWithSignal(iterator.next(), signal);
+      if (step.done) {
+        completed = true;
+        break;
+      }
+
+      const chunk = step.value;
+      throwIfAborted(signal);
+
+      if (chunk.usage) {
+        accumulateUsage(totalUsage, chunk.usage);
+      }
+
+      const delta = chunk.choices?.[0]?.delta;
+      if (!delta) {
+        continue;
+      }
+
+      if (typeof delta.content === "string" && delta.content.length > 0) {
+        content += delta.content;
+        onDelta?.(delta.content);
+      }
+
+      if (delta.tool_calls && delta.tool_calls.length > 0) {
+        for (const tc of delta.tool_calls) {
+          const idx = typeof tc.index === "number" ? tc.index : 0;
+          const existing = toolCallsByIndex.get(idx) ?? {
+            id: "",
+            type: "function" as const,
+            functionName: "",
+            functionArguments: "",
+            customName: "",
+            customInput: "",
+          };
+
+          if (tc.id) {
+            existing.id = tc.id;
+          }
+          if (tc.type) {
+            existing.type = tc.type;
+          }
+          if (tc.function?.name) {
+            existing.functionName += tc.function.name;
+          }
+          if (tc.function?.arguments) {
+            existing.functionArguments += tc.function.arguments;
+          }
+          if (tc.custom?.name) {
+            existing.customName += tc.custom.name;
+          }
+          if (tc.custom?.input) {
+            existing.customInput += tc.custom.input;
+          }
+
+          toolCallsByIndex.set(idx, existing);
+        }
+      }
+    }
+  } finally {
+    if (!completed) {
+      await iterator.return?.().catch(() => {});
+    }
+  }
+
+  throwIfAborted(signal);
+
+  const toolCalls: ChatCompletionMessageToolCall[] = Array.from(
+    toolCallsByIndex.entries(),
+  )
+    .sort(([indexA], [indexB]) => indexA - indexB)
+    .map(([, acc]) => {
+      if (!acc.id) {
+        throw new Error("Streamed tool call missing id");
+      }
+
+      return acc.type === "custom"
+        ? {
+            id: acc.id,
+            type: "custom",
+            custom: {
+              name: acc.customName,
+              input: acc.customInput,
+            },
+          }
+        : {
+            id: acc.id,
+            type: "function",
+            function: {
+              name: acc.functionName,
+              arguments: acc.functionArguments,
+            },
+          };
+    });
+
+  return { content, toolCalls };
+}
+
+export async function processChatMessage(
+  input: ProcessChatMessageInput,
+  deps?: ChatServiceDeps,
+): Promise<ProcessChatMessageResult> {
+  const context = await prepareChatContext(input, deps);
+  const openaiClient: NonNullable<ChatServiceDeps["openai"]> =
+    deps?.openai ?? openai;
+
   const totalUsage: ChatResponseUsage = {
     promptTokens: 0,
     completionTokens: 0,
@@ -285,8 +645,8 @@ export async function processChatMessage(
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const response = await openaiClient.chat.completions.create({
       ...COMPLETION_BASE_PARAMS,
-      user: normalizedToken,
-      messages,
+      user: context.normalizedToken,
+      messages: context.messages,
       tools: CHAT_TOOLS,
       tool_choice: "auto",
     });
@@ -302,88 +662,174 @@ export async function processChatMessage(
       break;
     }
 
-    messages.push({
-      role: "assistant",
-      content: assistantMessage.content ?? null,
-      tool_calls: toolCalls,
+    await executeAndAppendToolRound({
+      toolCalls,
+      assistantContent: assistantMessage.content ?? null,
+      messages: context.messages,
+      candidateBooks,
+      runToolCall: context.runToolCall,
+      toolDeps: deps?.toolDeps,
     });
-
-    const toolResults = await Promise.all(
-      toolCalls.map((toolCall) => runToolCall(toolCall, deps?.toolDeps)),
-    );
-
-    for (const result of toolResults) {
-      for (const book of result.books) {
-        mergeCandidateBook(candidateBooks, book);
-      }
-
-      messages.push({
-        role: "tool",
-        tool_call_id: result.toolCallId,
-        content: result.content,
-      });
-    }
   }
 
   if (!hasFinalReply) {
     const finalResponse = await openaiClient.chat.completions.create({
       ...COMPLETION_BASE_PARAMS,
-      user: normalizedToken,
-      messages,
+      user: context.normalizedToken,
+      messages: context.messages,
     });
 
     accumulateUsage(totalUsage, finalResponse.usage);
     modelReply = finalResponse.choices[0]?.message.content ?? "";
   }
 
-  const usedFallback = !modelReply.trim();
-  if (usedFallback) {
-    modelReply = FALLBACK_EMPTY_REPLY;
-  }
+  return finalizeChatResult({
+    context,
+    userInputMessage: input.message,
+    rawModelReply: modelReply,
+    candidateBooks,
+    totalUsage,
+  });
+}
 
-  const userMessage: StoredChatMessage = {
-    id: generateId(),
-    role: "user",
-    content: message,
-    createdAt: now().toISOString(),
+/**
+ * Processes a chat message while streaming tokens in real time across tool-calling rounds.
+ * Persists user/assistant turns to Redis only upon uncancelled completion.
+ */
+export async function streamChatMessage(
+  input: StreamChatMessageInput,
+  deps?: ChatStreamServiceDeps,
+): Promise<ProcessChatMessageResult> {
+  const { signal, onDelta } = input;
+  const context = await prepareChatContext(input, deps, signal);
+  const openaiClient: NonNullable<ChatStreamServiceDeps["openai"]> =
+    deps?.openai ?? openai;
+
+  const totalUsage: ChatResponseUsage = {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
   };
 
-  const assistantMessage: StoredChatMessage = {
-    id: generateId(),
-    role: "assistant",
-    content: modelReply,
-    createdAt: now().toISOString(),
+  const candidateBooks = new Map<string, ToolBookCandidate>();
+  let modelReply = "";
+  let streamedPrefix = "";
+  let hasFinalReply = false;
+  let hasEmittedVisibleContent = false;
+  let pendingLeadingWhitespace = "";
+  let needsSeparatorBeforeNextVisible = false;
+  const requestOptions = signal ? { signal } : undefined;
+
+  const forwardDelta = (delta: string) => {
+    if (!hasEmittedVisibleContent) {
+      if (!delta.trim()) {
+        pendingLeadingWhitespace += delta;
+        return;
+      }
+
+      hasEmittedVisibleContent = true;
+      onDelta?.(`${pendingLeadingWhitespace}${delta}`);
+      pendingLeadingWhitespace = "";
+      return;
+    }
+
+    if (needsSeparatorBeforeNextVisible) {
+      if (/^\s/.test(delta)) {
+        needsSeparatorBeforeNextVisible = false;
+      } else if (delta.trim().length > 0) {
+        onDelta?.("\n\n");
+        streamedPrefix += "\n\n";
+        needsSeparatorBeforeNextVisible = false;
+      }
+    }
+
+    onDelta?.(delta);
   };
 
-  const updatedHistory: StoredChatMessage[] = [
-    ...messageHistory,
-    userMessage,
-    assistantMessage,
-  ];
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    throwIfAborted(signal);
 
-  if (sessionTtl > 0) {
-    await redisClient.set(
-      redisKey,
-      JSON.stringify(updatedHistory),
-      "EX",
-      sessionTtl,
+    const stream = await raceWithSignal(
+      openaiClient.chat.completions.create(
+        {
+          ...COMPLETION_BASE_PARAMS,
+          user: context.normalizedToken,
+          messages: context.messages,
+          tools: CHAT_TOOLS,
+          tool_choice: "auto",
+          stream: true,
+          stream_options: { include_usage: true },
+        },
+        requestOptions,
+      ),
+      signal,
     );
+
+    const outcome = await consumeCompletionStream(
+      stream,
+      totalUsage,
+      signal,
+      forwardDelta,
+    );
+
+    if (outcome.toolCalls.length === 0) {
+      modelReply = outcome.content;
+      hasFinalReply = true;
+      break;
+    }
+
+    if (outcome.content.length > 0) {
+      streamedPrefix += outcome.content;
+      if (hasEmittedVisibleContent && !/\s$/.test(streamedPrefix)) {
+        needsSeparatorBeforeNextVisible = true;
+      }
+    }
+
+    await executeAndAppendToolRound({
+      toolCalls: outcome.toolCalls,
+      assistantContent: outcome.content || null,
+      messages: context.messages,
+      candidateBooks,
+      runToolCall: context.runToolCall,
+      toolDeps: deps?.toolDeps,
+      signal,
+    });
   }
 
-  const citedBooks = usedFallback
-    ? []
-    : Array.from(candidateBooks.values())
-        .filter((book) => isBookCitedInReply(book.title, modelReply))
-        .map(toCitedBook);
+  if (!hasFinalReply) {
+    throwIfAborted(signal);
 
-  return {
-    data: {
-      userMessage: message,
-      modelReply,
-      books: citedBooks,
-    },
-    meta: {
-      usage: totalUsage,
-    },
-  };
+    const finalStream = await raceWithSignal(
+      openaiClient.chat.completions.create(
+        {
+          ...COMPLETION_BASE_PARAMS,
+          user: context.normalizedToken,
+          messages: context.messages,
+          stream: true,
+          stream_options: { include_usage: true },
+        },
+        requestOptions,
+      ),
+      signal,
+    );
+
+    const finalOutcome = await consumeCompletionStream(
+      finalStream,
+      totalUsage,
+      signal,
+      forwardDelta,
+    );
+
+    modelReply = finalOutcome.content;
+  }
+
+  return finalizeChatResult({
+    context,
+    userInputMessage: input.message,
+    rawModelReply: `${streamedPrefix}${modelReply}`,
+    candidateBooks,
+    totalUsage,
+    signal,
+    onFallback: (fallbackReply) => onDelta?.(fallbackReply),
+  });
 }

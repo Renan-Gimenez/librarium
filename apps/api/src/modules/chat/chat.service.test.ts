@@ -1,7 +1,9 @@
 import { describe, expect, it, mock } from "bun:test";
 import type {
   ChatCompletion,
+  ChatCompletionChunk,
   ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
   ChatCompletionMessageToolCall,
 } from "openai/resources/chat/completions";
 
@@ -12,7 +14,9 @@ import {
   isBookCitedInReply,
   MAX_TOOL_ROUNDS,
   processChatMessage,
+  streamChatMessage,
   type ChatServiceDeps,
+  type ChatStreamServiceDeps,
   type StoredChatMessage,
 } from "./chat.service";
 
@@ -846,5 +850,833 @@ describe("chat.service", () => {
       "É uma excelente obra de Frank Herbert!",
     );
     expect(sentMessages[3]?.content).toBe("Tem mais dele?");
+  });
+});
+
+function makeChunk(params: {
+  content?: string | null;
+  toolCalls?: ChatCompletionChunk.Choice.Delta.ToolCall[];
+  finishReason?: ChatCompletionChunk.Choice["finish_reason"];
+  usage?: { prompt: number; completion: number; total: number } | null;
+  emptyChoices?: boolean;
+}): ChatCompletionChunk {
+  return {
+    id: "chatcmpl-stream-test",
+    object: "chat.completion.chunk",
+    created: 1700000000,
+    model: "gpt-4o-mini",
+    choices: params.emptyChoices
+      ? []
+      : [
+          {
+            index: 0,
+            finish_reason: params.finishReason ?? null,
+            logprobs: null,
+            delta: {
+              ...(params.content !== undefined && { content: params.content }),
+              ...(params.toolCalls !== undefined && {
+                tool_calls: params.toolCalls,
+              }),
+            },
+          },
+        ],
+    ...(params.usage !== undefined && {
+      usage: params.usage
+        ? {
+            prompt_tokens: params.usage.prompt,
+            completion_tokens: params.usage.completion,
+            total_tokens: params.usage.total,
+          }
+        : null,
+    }),
+  };
+}
+
+function createStreamDeps(
+  streamFactories: Array<
+    (
+      body: ChatCompletionCreateParamsStreaming,
+      options?: { signal?: AbortSignal },
+    ) => AsyncIterable<ChatCompletionChunk>
+  >,
+  overrides: Partial<ChatStreamServiceDeps> = {},
+) {
+  let callIndex = 0;
+  const recordedCalls: Array<{
+    body: ChatCompletionCreateParamsStreaming;
+    signal?: AbortSignal;
+  }> = [];
+
+  const createMock = mock(
+    async (
+      body: ChatCompletionCreateParamsStreaming,
+      options?: { signal?: AbortSignal },
+    ) => {
+      recordedCalls.push({
+        body: JSON.parse(JSON.stringify(body)),
+        signal: options?.signal,
+      });
+      const factory = streamFactories[callIndex];
+      callIndex += 1;
+      if (!factory) {
+        throw new Error(`Unexpected OpenAI stream call #${callIndex}`);
+      }
+      return factory(body, options);
+    },
+  );
+
+  let storedValue: string | null = null;
+  let storedKey: string | null = null;
+  let storedTtl: number | null = null;
+
+  const redisMock = {
+    get: mock(async (_key: string) => storedValue),
+    set: mock(
+      async (
+        key: string,
+        value: string,
+        _expiryMode: "EX",
+        seconds: number,
+      ) => {
+        storedKey = key;
+        storedValue = value;
+        storedTtl = seconds;
+        return "OK" as const;
+      },
+    ),
+  };
+
+  const prismaMock = {
+    genre: {
+      findMany: mock(async () => [
+        { slug: "ficcao", name: "Ficção" },
+        { slug: "ficcao-cientifica", name: "Ficção Científica" },
+      ]),
+    },
+  };
+
+  let idSeq = 0;
+
+  const deps: ChatStreamServiceDeps = {
+    prisma: prismaMock,
+    redis: redisMock,
+    openai: {
+      chat: {
+        completions: {
+          create: createMock,
+        },
+      },
+    },
+    sessionTtl: 3600,
+    now: () => new Date("2026-11-20T22:00:00.000Z"),
+    generateId: () => `stream-msg-${++idSeq}`,
+    ...overrides,
+  };
+
+  return {
+    deps,
+    recordedCalls,
+    createMock,
+    redisMock,
+    getStored: () => ({
+      key: storedKey,
+      ttl: storedTtl,
+      messages: storedValue
+        ? (JSON.parse(storedValue) as StoredChatMessage[])
+        : [],
+    }),
+  };
+}
+
+async function* chunksToStream(
+  chunks: ChatCompletionChunk[],
+): AsyncIterable<ChatCompletionChunk> {
+  for (const chunk of chunks) {
+    yield chunk;
+  }
+}
+
+describe("chat.service > streamChatMessage", () => {
+  it("rejects empty or whitespace-only session tokens", async () => {
+    const { deps } = createStreamDeps([]);
+
+    await expect(
+      streamChatMessage({ token: "   ", message: "Olá" }, deps),
+    ).rejects.toThrow("Session token is required");
+  });
+
+  it("streams direct reply without tools, skips empty content chunks, preserves space tokens, sums usage, and saves Redis atomically", async () => {
+    const deltas: string[] = [];
+    const controller = new AbortController();
+
+    const { deps, recordedCalls, redisMock, getStored } = createStreamDeps([
+      () =>
+        chunksToStream([
+          makeChunk({ content: "" }),
+          makeChunk({ content: null }),
+          makeChunk({ content: "Olá" }),
+          makeChunk({ content: " " }),
+          makeChunk({ content: "leitor!" }),
+          makeChunk({ finishReason: "stop" }),
+          makeChunk({
+            emptyChoices: true,
+            usage: { prompt: 110, completion: 15, total: 125 },
+          }),
+        ]),
+    ]);
+
+    const result = await streamChatMessage(
+      {
+        token: " session-stream-1 ",
+        message: "Olá, quem é você?",
+        signal: controller.signal,
+        onDelta: (delta) => deltas.push(delta),
+      },
+      deps,
+    );
+
+    expect(deltas).toEqual(["Olá", " ", "leitor!"]);
+    expect(recordedCalls).toHaveLength(1);
+    expect(recordedCalls[0]?.body.stream).toBe(true);
+    expect(recordedCalls[0]?.body.stream_options).toEqual({
+      include_usage: true,
+    });
+    expect(recordedCalls[0]?.body.tools).toHaveLength(2);
+    expect(recordedCalls[0]?.signal).toBe(controller.signal);
+
+    expect(result).toEqual({
+      data: {
+        userMessage: "Olá, quem é você?",
+        modelReply: "Olá leitor!",
+        books: [],
+      },
+      meta: {
+        usage: {
+          promptTokens: 110,
+          completionTokens: 15,
+          totalTokens: 125,
+        },
+      },
+    });
+
+    expect(redisMock.set).toHaveBeenCalledTimes(1);
+    const stored = getStored();
+    expect(stored.key).toBe("chat:session:session-stream-1:messages");
+    expect(stored.ttl).toBe(3600);
+    expect(stored.messages).toHaveLength(2);
+    expect(stored.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+  });
+
+  it("accumulates fragmented interleaved delta.tool_calls by index (name + arguments), runs tools in parallel, streams final reply, and resolves Unicode citations", async () => {
+    const solaris = makeSimilarBook({
+      id: "sol-1",
+      title: "Solaris",
+      similarity: 0.89,
+    });
+    const revolucao = makeStructuredBook({
+      id: "rev-1",
+      title: "A Revolução dos Bichos",
+      author: "George Orwell",
+    });
+
+    const listBooksMock = mock(async () => ({
+      books: [revolucao],
+      meta: { total: 1, page: 1, limit: 5, totalPages: 1 },
+    }));
+    const searchSimilarMock = mock(async () => [solaris]);
+
+    const deltas: string[] = [];
+
+    const { deps, recordedCalls, getStored } = createStreamDeps(
+      [
+        // Round 1: interleaved fragmented tool calls at index 1 then index 0, with split names & args
+        () =>
+          chunksToStream([
+            makeChunk({ content: "" }),
+            makeChunk({
+              toolCalls: [
+                {
+                  index: 1,
+                  id: "call_sem_1",
+                  type: "function",
+                  function: { name: "searchSemantic", arguments: '{"qu' },
+                },
+              ],
+            }),
+            makeChunk({
+              toolCalls: [
+                {
+                  index: 0,
+                  id: "call_str_0",
+                  type: "function",
+                  function: { name: "search", arguments: '{"genre":' },
+                },
+              ],
+            }),
+            makeChunk({
+              toolCalls: [
+                {
+                  index: 1,
+                  function: { name: "Books", arguments: 'ery":"solidão"}' },
+                },
+                {
+                  index: 0,
+                  function: { name: "Books", arguments: '"ficcao"}' },
+                },
+              ],
+            }),
+            makeChunk({ finishReason: "tool_calls" }),
+            makeChunk({
+              emptyChoices: true,
+              usage: { prompt: 120, completion: 30, total: 150 },
+            }),
+          ]),
+        // Round 2: final response stream
+        () =>
+          chunksToStream([
+            makeChunk({ content: "Recomendo **Solaris** " }),
+            makeChunk({ content: "e *A Revolucao\ndos Bichos*." }),
+            makeChunk({ finishReason: "stop" }),
+            makeChunk({
+              emptyChoices: true,
+              usage: { prompt: 240, completion: 25, total: 265 },
+            }),
+          ]),
+      ],
+      {
+        toolDeps: {
+          listBooks: listBooksMock,
+          searchSimilarBooks: searchSimilarMock,
+        },
+      },
+    );
+
+    const result = await streamChatMessage(
+      {
+        token: "session-tools-stream",
+        message: "Quero ficção sobre solidão",
+        onDelta: (delta) => deltas.push(delta),
+      },
+      deps,
+    );
+
+    expect(listBooksMock).toHaveBeenCalledTimes(1);
+    expect(searchSimilarMock).toHaveBeenCalledWith("solidão", 5, 0.25);
+    expect(deltas).toEqual([
+      "Recomendo **Solaris** ",
+      "e *A Revolucao\ndos Bichos*.",
+    ]);
+
+    // Verify tool calls were ordered by index (0 then 1) in round 2 history
+    const round2Messages = recordedCalls[1]?.body.messages ?? [];
+    expect(round2Messages.map((m) => m.role)).toEqual([
+      "system",
+      "user",
+      "assistant",
+      "tool",
+      "tool",
+    ]);
+    const assistantMsg = round2Messages[2] as {
+      tool_calls?: { id: string; function: { name: string } }[];
+    };
+    expect(assistantMsg.tool_calls?.map((tc) => tc.id)).toEqual([
+      "call_str_0",
+      "call_sem_1",
+    ]);
+
+    expect(result.data.books.map((b) => b.id)).toEqual(["rev-1", "sol-1"]);
+    expect(result.data.books[0]?.similarity).toBeUndefined();
+    expect(result.data.books[1]?.similarity).toBe(89);
+    expect(result.meta.usage).toEqual({
+      promptTokens: 360,
+      completionTokens: 55,
+      totalTokens: 415,
+    });
+
+    const stored = getStored();
+    expect(
+      stored.messages.every((m) => m.role === "user" || m.role === "assistant"),
+    ).toBe(true);
+    expect(stored.messages).toHaveLength(2);
+  });
+
+  it("forces 1 final streamed call without tools after MAX_TOOL_ROUNDS exhaustion and emits FALLBACK_EMPTY_REPLY with books: [] when reply is empty", async () => {
+    const acervoBook = makeStructuredBook({
+      id: "acervo-stream",
+      title: "Acervo",
+    });
+    const deltas: string[] = [];
+
+    const toolRoundFactories = Array.from({ length: MAX_TOOL_ROUNDS }, (_, idx) =>
+      () =>
+        chunksToStream([
+          makeChunk({
+            toolCalls: [
+              {
+                index: 0,
+                id: `call_round_${idx}`,
+                type: "function",
+                function: {
+                  name: "searchBooks",
+                  arguments: JSON.stringify({ query: `q${idx}` }),
+                },
+              },
+            ],
+          }),
+          makeChunk({
+            emptyChoices: true,
+            usage: { prompt: 40, completion: 10, total: 50 },
+          }),
+        ]),
+    );
+
+    const finalFallbackFactory = () =>
+      chunksToStream([
+        makeChunk({ content: "   " }),
+        makeChunk({ finishReason: "stop" }),
+        makeChunk({
+          emptyChoices: true,
+          usage: { prompt: 70, completion: 0, total: 70 },
+        }),
+      ]);
+
+    const { deps, recordedCalls, getStored } = createStreamDeps(
+      [...toolRoundFactories, finalFallbackFactory],
+      {
+        toolDeps: {
+          listBooks: mock(async () => ({
+            books: [acervoBook],
+            meta: { total: 1, page: 1, limit: 5, totalPages: 1 },
+          })),
+        },
+      },
+    );
+
+    const result = await streamChatMessage(
+      {
+        token: "session-exhaust-stream",
+        message: "tente 4 rodadas",
+        onDelta: (delta) => deltas.push(delta),
+      },
+      deps,
+    );
+
+    expect(recordedCalls).toHaveLength(MAX_TOOL_ROUNDS + 1);
+    for (let i = 0; i < MAX_TOOL_ROUNDS; i++) {
+      expect(recordedCalls[i]?.body.tools).toBeDefined();
+      expect(recordedCalls[i]?.body.stream).toBe(true);
+    }
+    const finalCall = recordedCalls[MAX_TOOL_ROUNDS]?.body;
+    expect(finalCall?.tools).toBeUndefined();
+    expect(finalCall?.tool_choice).toBeUndefined();
+    expect(finalCall?.stream).toBe(true);
+    expect(finalCall?.stream_options).toEqual({ include_usage: true });
+
+    expect(deltas).toContain(FALLBACK_EMPTY_REPLY);
+    expect(result.data.modelReply).toBe(FALLBACK_EMPTY_REPLY);
+    expect(result.data.books).toEqual([]);
+    expect(getStored().messages[1]?.content).toBe(FALLBACK_EMPTY_REPLY);
+  });
+
+  it("aborts before first token without calling Redis", async () => {
+    const controller = new AbortController();
+    const { deps, redisMock } = createStreamDeps([
+      async function* () {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        yield makeChunk({ content: "Nunca deveria chegar" });
+      },
+    ]);
+
+    const promise = streamChatMessage(
+      {
+        token: "session-abort-early",
+        message: "Olá",
+        signal: controller.signal,
+      },
+      deps,
+    );
+
+    controller.abort();
+
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+    expect(redisMock.set).not.toHaveBeenCalled();
+  });
+
+  it("aborts after partial tokens without persisting truncated reply to Redis", async () => {
+    const controller = new AbortController();
+    const deltas: string[] = [];
+
+    const { deps, redisMock } = createStreamDeps([
+      async function* () {
+        yield makeChunk({ content: "Texto " });
+        yield makeChunk({ content: "parcial" });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        yield makeChunk({ content: " que não deve aparecer" });
+      },
+    ]);
+
+    const promise = streamChatMessage(
+      {
+        token: "session-abort-partial",
+        message: "Conte mais",
+        signal: controller.signal,
+        onDelta: (delta) => {
+          deltas.push(delta);
+          if (deltas.length === 2) {
+            controller.abort();
+          }
+        },
+      },
+      deps,
+    );
+
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+    expect(deltas).toEqual(["Texto ", "parcial"]);
+    expect(redisMock.set).not.toHaveBeenCalled();
+  });
+
+  it("does not save to Redis if OpenAI stream fails mid-stream", async () => {
+    const deltas: string[] = [];
+    const { deps, redisMock } = createStreamDeps([
+      async function* () {
+        yield makeChunk({ content: "Início" });
+        throw new Error("OpenAI stream dropped");
+      },
+    ]);
+
+    await expect(
+      streamChatMessage(
+        {
+          token: "session-err-mid",
+          message: "Teste erro",
+          onDelta: (delta) => deltas.push(delta),
+        },
+        deps,
+      ),
+    ).rejects.toThrow("OpenAI stream dropped");
+
+    expect(deltas).toEqual(["Início"]);
+    expect(redisMock.set).not.toHaveBeenCalled();
+  });
+
+  it("synchronizes pre-tool delta.content with modelReply and Redis, inserting paragraph separator when needed", async () => {
+    const solaris = makeSimilarBook({
+      id: "sol-prefix",
+      title: "Solaris",
+      similarity: 0.9,
+    });
+    const deltas: string[] = [];
+
+    const { deps, getStored } = createStreamDeps(
+      [
+        () =>
+          chunksToStream([
+            makeChunk({ content: "Vou buscar no acervo." }),
+            makeChunk({
+              toolCalls: [
+                {
+                  index: 0,
+                  id: "call_pre",
+                  type: "function",
+                  function: {
+                    name: "searchSemanticBooks",
+                    arguments: JSON.stringify({ query: "espaço" }),
+                  },
+                },
+              ],
+            }),
+            makeChunk({
+              emptyChoices: true,
+              usage: { prompt: 50, completion: 15, total: 65 },
+            }),
+          ]),
+        () =>
+          chunksToStream([
+            makeChunk({ content: "Recomendo **Solaris**." }),
+            makeChunk({
+              emptyChoices: true,
+              usage: { prompt: 100, completion: 10, total: 110 },
+            }),
+          ]),
+      ],
+      {
+        toolDeps: {
+          searchSimilarBooks: mock(async () => [solaris]),
+        },
+      },
+    );
+
+    const result = await streamChatMessage(
+      {
+        token: "session-pretool",
+        message: "Livro espacial",
+        onDelta: (delta) => deltas.push(delta),
+      },
+      deps,
+    );
+
+    expect(deltas).toEqual([
+      "Vou buscar no acervo.",
+      "\n\n",
+      "Recomendo **Solaris**.",
+    ]);
+    expect(deltas.join("")).toBe("Vou buscar no acervo.\n\nRecomendo **Solaris**.");
+    expect(result.data.modelReply).toBe(deltas.join(""));
+    expect(getStored().messages[1]?.content).toBe(deltas.join(""));
+    expect(result.data.books.map((b) => b.id)).toEqual(["sol-prefix"]);
+  });
+
+  it("suppresses leading whitespace-only deltas when entire reply is whitespace and emits only FALLBACK_EMPTY_REPLY", async () => {
+    const deltas: string[] = [];
+
+    const { deps, getStored } = createStreamDeps([
+      () =>
+        chunksToStream([
+          makeChunk({ content: "  " }),
+          makeChunk({ content: "\n  " }),
+          makeChunk({ finishReason: "stop" }),
+          makeChunk({
+            emptyChoices: true,
+            usage: { prompt: 20, completion: 2, total: 22 },
+          }),
+        ]),
+    ]);
+
+    const result = await streamChatMessage(
+      {
+        token: "session-ws-only",
+        message: "Oi",
+        onDelta: (delta) => deltas.push(delta),
+      },
+      deps,
+    );
+
+    expect(deltas).toEqual([FALLBACK_EMPTY_REPLY]);
+    expect(result.data.modelReply).toBe(FALLBACK_EMPTY_REPLY);
+    expect(getStored().messages[1]?.content).toBe(FALLBACK_EMPTY_REPLY);
+  });
+
+  it("calls iterator.return() on both signal abort and non-abort mid-stream errors", async () => {
+    // 1. Abort case
+    const abortController = new AbortController();
+    const abortReturnSpy = mock(async () => ({ value: undefined, done: true as const }));
+    let abortStep = 0;
+
+    const abortIterable: AsyncIterable<ChatCompletionChunk> = {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => {
+          abortStep += 1;
+          if (abortStep === 1) {
+            return { value: makeChunk({ content: "Parcial" }), done: false };
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          return { value: makeChunk({ content: "Depois" }), done: false };
+        },
+        return: abortReturnSpy,
+      }),
+    };
+
+    const { deps: abortDeps } = createStreamDeps([() => abortIterable]);
+
+    const abortPromise = streamChatMessage(
+      {
+        token: "session-iter-abort",
+        message: "Oi",
+        signal: abortController.signal,
+        onDelta: () => abortController.abort(),
+      },
+      abortDeps,
+    );
+
+    await expect(abortPromise).rejects.toMatchObject({ name: "AbortError" });
+    expect(abortReturnSpy).toHaveBeenCalledTimes(1);
+
+    // 2. Non-abort error case (stream throws or onDelta throws)
+    const errReturnSpy = mock(async () => ({ value: undefined, done: true as const }));
+    let errStep = 0;
+
+    const errorIterable: AsyncIterable<ChatCompletionChunk> = {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => {
+          errStep += 1;
+          if (errStep === 1) {
+            return { value: makeChunk({ content: "Token" }), done: false };
+          }
+          throw new Error("Stream read error");
+        },
+        return: errReturnSpy,
+      }),
+    };
+
+    const { deps: errDeps } = createStreamDeps([() => errorIterable]);
+
+    await expect(
+      streamChatMessage(
+        {
+          token: "session-iter-err",
+          message: "Oi",
+        },
+        errDeps,
+      ),
+    ).rejects.toThrow("Stream read error");
+    expect(errReturnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores chunks with missing or empty choices safely without throwing TypeError", async () => {
+    const deltas: string[] = [];
+    const missingChoicesChunk = {
+      id: "chatcmpl-missing-choices",
+      object: "chat.completion.chunk",
+      created: 1700000000,
+      model: "gpt-4o-mini",
+    } as unknown as ChatCompletionChunk;
+
+    const { deps } = createStreamDeps([
+      () =>
+        chunksToStream([
+          missingChoicesChunk,
+          makeChunk({ emptyChoices: true }),
+          makeChunk({ content: "Ok!" }),
+          makeChunk({
+            emptyChoices: true,
+            usage: { prompt: 10, completion: 2, total: 12 },
+          }),
+        ]),
+    ]);
+
+    const result = await streamChatMessage(
+      {
+        token: "session-missing-choices",
+        message: "Oi",
+        onDelta: (delta) => deltas.push(delta),
+      },
+      deps,
+    );
+
+    expect(deltas).toEqual(["Ok!"]);
+    expect(result.data.modelReply).toBe("Ok!");
+  });
+
+  it("aborts cleanly during prepareChatContext, tool round execution, and redis.set without emitting fallback", async () => {
+    // 1. Abort during prepareChatContext
+    const ctxController = new AbortController();
+    const { deps: ctxDeps, createMock: ctxOpenAiMock } = createStreamDeps([], {
+      redis: {
+        get: mock(async () => {
+          ctxController.abort();
+          return null;
+        }),
+        set: mock(async () => "OK"),
+      },
+    });
+
+    await expect(
+      streamChatMessage(
+        {
+          token: "session-abort-ctx",
+          message: "Oi",
+          signal: ctxController.signal,
+        },
+        ctxDeps,
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(ctxOpenAiMock).not.toHaveBeenCalled();
+
+    // 2. Abort during executeAndAppendToolRound
+    const toolController = new AbortController();
+    const { deps: toolDeps, redisMock: toolRedisMock } = createStreamDeps(
+      [
+        () =>
+          chunksToStream([
+            makeChunk({
+              toolCalls: [
+                {
+                  index: 0,
+                  id: "call_abort_tool",
+                  type: "function",
+                  function: {
+                    name: "searchBooks",
+                    arguments: JSON.stringify({ query: "Duna" }),
+                  },
+                },
+              ],
+            }),
+          ]),
+      ],
+      {
+        executeToolCall: mock(async (tc) => {
+          toolController.abort();
+          return { toolCallId: tc.id, content: '{"books":[]}', books: [] };
+        }),
+      },
+    );
+
+    await expect(
+      streamChatMessage(
+        {
+          token: "session-abort-tool",
+          message: "Duna",
+          signal: toolController.signal,
+        },
+        toolDeps,
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(toolRedisMock.set).not.toHaveBeenCalled();
+
+    // 3. Failure during redis.set in finalizeChatResult must NOT emit FALLBACK_EMPTY_REPLY
+    const failRedisDeltas: string[] = [];
+    const { deps: failRedisDeps } = createStreamDeps(
+      [() => chunksToStream([makeChunk({ content: "   " })])],
+      {
+        redis: {
+          get: mock(async () => null),
+          set: mock(async () => {
+            throw new Error("Redis write failed");
+          }),
+        },
+      },
+    );
+
+    await expect(
+      streamChatMessage(
+        {
+          token: "session-redis-fail",
+          message: "Oi",
+          onDelta: (d) => failRedisDeltas.push(d),
+        },
+        failRedisDeps,
+      ),
+    ).rejects.toThrow("Redis write failed");
+    expect(failRedisDeltas).toEqual([]);
+
+    // 4. Abort during redis.set in finalizeChatResult must NOT emit FALLBACK_EMPTY_REPLY
+    const abortRedisController = new AbortController();
+    const abortRedisDeltas: string[] = [];
+    const { deps: abortRedisDeps } = createStreamDeps(
+      [() => chunksToStream([makeChunk({ content: "" })])],
+      {
+        redis: {
+          get: mock(async () => null),
+          set: mock(async () => {
+            abortRedisController.abort();
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            return "OK";
+          }),
+        },
+      },
+    );
+
+    await expect(
+      streamChatMessage(
+        {
+          token: "session-redis-abort",
+          message: "Oi",
+          signal: abortRedisController.signal,
+          onDelta: (d) => abortRedisDeltas.push(d),
+        },
+        abortRedisDeps,
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(abortRedisDeltas).toEqual([]);
   });
 });

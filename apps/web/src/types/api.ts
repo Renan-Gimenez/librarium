@@ -81,6 +81,15 @@ export interface ChatMessage {
   createdAt?: string;
   books?: CitedBook[];
   isCancelled?: boolean;
+  isStreaming?: boolean;
+}
+
+export interface ChatStreamDeltaEvent {
+  content: string;
+}
+
+export interface ChatStreamErrorEvent {
+  message: string;
 }
 
 export interface ChatApiRequest {
