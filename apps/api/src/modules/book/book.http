@@ -1,4 +1,5 @@
 @baseURL = http://localhost:3333/api
+@adminKey = dev-admin-api-key
 
 ### List all books (with pagination)
 GET {{baseURL}}/books?page=1&limit=10
@@ -29,6 +30,7 @@ GET {{baseURL}}/books/{{bookId}}
 ### Create a new book
 POST {{baseURL}}/books
 Content-Type: application/json
+X-Admin-Key: {{adminKey}}
 
 {
   "title": "O Chamado de Cthulhu",
@@ -41,6 +43,7 @@ Content-Type: application/json
 ### Update book by ID
 PUT {{baseURL}}/books/{{bookId}}
 Content-Type: application/json
+X-Admin-Key: {{adminKey}}
 
 {
   "title": "O Chamado de Cthulhu - Edição Especial",
@@ -49,10 +52,12 @@ Content-Type: application/json
 
 ### Delete book by ID
 DELETE {{baseURL}}/books/{{bookId}}
+X-Admin-Key: {{adminKey}}
 
 ### Reindex embeddings (mode: missing)
 POST {{baseURL}}/books/reindex
 Content-Type: application/json
+X-Admin-Key: {{adminKey}}
 
 {
   "mode": "missing"

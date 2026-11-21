@@ -55,6 +55,12 @@ if (env.NODE_ENV !== "production") {
             scheme: "bearer",
             description: "Insira sua API key no formato: Bearer <token>",
           },
+          adminApiKey: {
+            type: "apiKey",
+            in: "header",
+            name: "X-Admin-Key",
+            description: "Insira sua chave administrativa no header: X-Admin-Key",
+          },
         },
       },
     },

@@ -215,26 +215,125 @@ export const listBooks = async (
   };
 };
 
-export const createBook = async (input: BookInput) => {
-  const { genreSlugs = [], ...data } = input;
+type ExecuteRawClient = {
+  $executeRaw: (
+    query: TemplateStringsArray,
+    ...values: unknown[]
+  ) => Promise<unknown>;
+};
 
-  if (genreSlugs.length > 0) {
-    const existingGenres = await prisma.genre.findMany({
-      where: { slug: { in: genreSlugs } },
-    });
+type GenreRepo = {
+  findMany: (args: {
+    where: { slug: { in: string[] } };
+  }) => Promise<{ slug: string; name: string }[]>;
+};
 
-    if (existingGenres.length !== genreSlugs.length) {
-      const foundSlugs = new Set(existingGenres.map((g) => g.slug));
-      const missing = genreSlugs.filter((s) => !foundSlugs.has(s));
-      throw new Error(`Genre(s) not found: ${missing.join(", ")}`);
-    }
+const resolveGenresBySlugs = async (
+  genreSlugs: string[],
+  genreRepo: GenreRepo,
+) => {
+  const uniqueGenreSlugs = [...new Set(genreSlugs)];
+
+  if (uniqueGenreSlugs.length === 0) {
+    return {
+      uniqueGenreSlugs,
+      genres: [] as { slug: string; name: string }[],
+    };
   }
 
-  const existingGenres = genreSlugs.length
-    ? await prisma.genre.findMany({
-        where: { slug: { in: genreSlugs } },
-      })
-    : [];
+  const existingGenres = await genreRepo.findMany({
+    where: { slug: { in: uniqueGenreSlugs } },
+  });
+
+  if (existingGenres.length !== uniqueGenreSlugs.length) {
+    const foundSlugs = new Set(existingGenres.map((g) => g.slug));
+    const missing = uniqueGenreSlugs.filter((s) => !foundSlugs.has(s));
+    throw new Error(`Genre(s) not found: ${missing.join(", ")}`);
+  }
+
+  return {
+    uniqueGenreSlugs,
+    genres: existingGenres,
+  };
+};
+
+const createEmbeddingPersister = (
+  customSave?: typeof saveBookEmbedding,
+  fallbackDb?: Partial<ExecuteRawClient>,
+) => {
+  return (
+    bookId: string,
+    embedding: number[],
+    tx?: Partial<ExecuteRawClient>,
+    inTransaction = false,
+  ) => {
+    if (customSave) {
+      return customSave(bookId, embedding);
+    }
+
+    if (inTransaction) {
+      if (!tx?.$executeRaw) {
+        throw new Error("Transaction client must provide $executeRaw");
+      }
+
+      return saveBookEmbedding(bookId, embedding, {
+        prisma: {
+          $executeRaw: tx.$executeRaw.bind(tx),
+        },
+      });
+    }
+
+    const rawClient = tx?.$executeRaw
+      ? tx
+      : fallbackDb?.$executeRaw
+        ? fallbackDb
+        : prisma;
+
+    return saveBookEmbedding(bookId, embedding, {
+      prisma: {
+        $executeRaw: rawClient.$executeRaw!.bind(rawClient),
+      },
+    });
+  };
+};
+
+export interface CreateBookTx {
+  book: {
+    create: (args: {
+      data: Prisma.BookCreateInput;
+      include: { genres: true };
+    }) => Promise<BookWithGenres>;
+  };
+  $executeRaw?: ExecuteRawClient["$executeRaw"];
+}
+
+export interface CreateBookDeps {
+  prisma?: {
+    book?: CreateBookTx["book"];
+    genre: GenreRepo;
+    $executeRaw?: ExecuteRawClient["$executeRaw"];
+    $transaction?: <T>(fn: (tx: CreateBookTx) => Promise<T>) => Promise<T>;
+  };
+  generateEmbedding?: typeof generateEmbedding;
+  saveBookEmbedding?: typeof saveBookEmbedding;
+}
+
+export const createBook = async (
+  input: BookInput,
+  deps?: CreateBookDeps,
+): Promise<BookWithGenres> => {
+  const db: NonNullable<CreateBookDeps["prisma"]> = deps?.prisma ?? prisma;
+  const genEmbedding = deps?.generateEmbedding ?? generateEmbedding;
+  const persistEmbedding = createEmbeddingPersister(
+    deps?.saveBookEmbedding,
+    db,
+  );
+  const inTransaction = Boolean(db.$transaction);
+
+  const { genreSlugs = [], ...data } = input;
+
+  const { uniqueGenreSlugs, genres: existingGenres } =
+    await resolveGenresBySlugs(genreSlugs, db.genre);
 
   const searchableText = buildSearchableText({
     ...data,
@@ -242,29 +341,52 @@ export const createBook = async (input: BookInput) => {
     genres: existingGenres,
   });
 
-  const embedding = await generateEmbedding(searchableText);
+  const embedding = await genEmbedding(searchableText);
 
-  const book = await prisma.book.create({
-    data: {
-      title: data.title,
-      author: data.author,
-      description: data.description ?? null,
-      coverUrl: data.coverUrl ?? null,
-      rating: data.rating ?? null,
-      publishedAt: data.publishedAt ?? null,
-      genres: {
-        connect: genreSlugs.map((slug) => ({ slug })),
+  const runCreate = async (tx: CreateBookTx) => {
+    const book = await tx.book.create({
+      data: {
+        title: data.title,
+        author: data.author,
+        description: data.description ?? null,
+        coverUrl: data.coverUrl ?? null,
+        rating: data.rating ?? null,
+        publishedAt: data.publishedAt ?? null,
+        genres: {
+          connect: uniqueGenreSlugs.map((slug) => ({ slug })),
+        },
       },
-    },
-    include: {
-      genres: true,
-    },
-  });
+      include: {
+        genres: true,
+      },
+    });
 
-  await saveBookEmbedding(book.id, embedding);
+    await persistEmbedding(book.id, embedding, tx, inTransaction);
 
-  return book;
+    return book;
+  };
+
+  if (db.$transaction) {
+    return db.$transaction(runCreate);
+  }
+
+  if (!db.book) {
+    throw new Error("Prisma book repository or $transaction is required");
+  }
+
+  return runCreate({ book: db.book, $executeRaw: db.$executeRaw });
 };
+
+export interface UpdateBookTx {
+  book: {
+    update: (args: {
+      where: { id: string };
+      data: Prisma.BookUpdateInput;
+      include: { genres: true };
+    }) => Promise<BookWithGenres>;
+  };
+  $executeRaw?: ExecuteRawClient["$executeRaw"];
+}
 
 export interface UpdateBookDeps {
   prisma?: {
@@ -273,21 +395,11 @@ export interface UpdateBookDeps {
         where: { id: string };
         include: { genres: true };
       }) => Promise<BookWithGenres | null>;
-      update: (args: {
-        where: { id: string };
-        data: Prisma.BookUpdateInput;
-        include: { genres: true };
-      }) => Promise<BookWithGenres>;
+      update: UpdateBookTx["book"]["update"];
     };
-    genre: {
-      findMany: (args: {
-        where: { slug: { in: string[] } };
-      }) => Promise<{ slug: string; name: string }[]>;
-    };
-    $executeRaw?: (
-      query: TemplateStringsArray,
-      ...values: unknown[]
-    ) => Promise<unknown>;
+    genre: GenreRepo;
+    $executeRaw?: ExecuteRawClient["$executeRaw"];
+    $transaction?: <T>(fn: (tx: UpdateBookTx) => Promise<T>) => Promise<T>;
   };
   generateEmbedding?: typeof generateEmbedding;
   saveBookEmbedding?: typeof saveBookEmbedding;
@@ -338,16 +450,11 @@ export const updateBook = async (
 ): Promise<BookWithGenres | null> => {
   const db: NonNullable<UpdateBookDeps["prisma"]> = deps?.prisma ?? prisma;
   const genEmbedding = deps?.generateEmbedding ?? generateEmbedding;
-  const persistEmbedding =
-    deps?.saveBookEmbedding ??
-    ((bookId: string, embedding: number[]) =>
-      saveBookEmbedding(bookId, embedding, {
-        prisma: {
-          $executeRaw: db.$executeRaw
-            ? db.$executeRaw.bind(db)
-            : prisma.$executeRaw.bind(prisma),
-        },
-      }));
+  const persistEmbedding = createEmbeddingPersister(
+    deps?.saveBookEmbedding,
+    db,
+  );
+  const inTransaction = Boolean(db.$transaction);
 
   const existingBook = await db.book.findUnique({
     where: { id },
@@ -361,24 +468,12 @@ export const updateBook = async (
   const { genreSlugs, ...data } = input;
 
   let genresToConnect: { slug: string; name: string }[] = existingBook.genres;
-  const uniqueGenreSlugs =
-    genreSlugs !== undefined ? [...new Set(genreSlugs)] : undefined;
+  let uniqueGenreSlugs: string[] | undefined;
 
-  if (uniqueGenreSlugs !== undefined) {
-    if (uniqueGenreSlugs.length > 0) {
-      const existingGenres = await db.genre.findMany({
-        where: { slug: { in: uniqueGenreSlugs } },
-      });
-
-      if (existingGenres.length !== uniqueGenreSlugs.length) {
-        const foundSlugs = new Set(existingGenres.map((g) => g.slug));
-        const missing = uniqueGenreSlugs.filter((s) => !foundSlugs.has(s));
-        throw new Error(`Genre(s) not found: ${missing.join(", ")}`);
-      }
-      genresToConnect = existingGenres;
-    } else {
-      genresToConnect = [];
-    }
+  if (genreSlugs !== undefined) {
+    const resolved = await resolveGenresBySlugs(genreSlugs, db.genre);
+    uniqueGenreSlugs = resolved.uniqueGenreSlugs;
+    genresToConnect = resolved.genres;
   }
 
   const shouldRegenerateEmbedding = hasIndexableBookChanges(existingBook, input);
@@ -402,31 +497,35 @@ export const updateBook = async (
     embedding = await genEmbedding(searchableText);
   }
 
-  const updatedBook = await db.book.update({
-    where: { id },
-    data: {
-      ...(data.title !== undefined && { title: data.title }),
-      ...(data.author !== undefined && { author: data.author }),
-      ...(data.description !== undefined && { description: data.description }),
-      ...(data.coverUrl !== undefined && { coverUrl: data.coverUrl }),
-      ...(data.rating !== undefined && { rating: data.rating }),
-      ...(data.publishedAt !== undefined && { publishedAt: data.publishedAt }),
-      ...(uniqueGenreSlugs !== undefined && {
-        genres: {
-          set: uniqueGenreSlugs.map((slug) => ({ slug })),
-        },
-      }),
-    },
-    include: {
-      genres: true,
-    },
-  });
+  const runUpdate = async (tx: UpdateBookTx) => {
+    const updatedBook = await tx.book.update({
+      where: { id },
+      data: {
+        ...(data.title !== undefined && { title: data.title }),
+        ...(data.author !== undefined && { author: data.author }),
+        ...(data.description !== undefined && { description: data.description }),
+        ...(data.coverUrl !== undefined && { coverUrl: data.coverUrl }),
+        ...(data.rating !== undefined && { rating: data.rating }),
+        ...(data.publishedAt !== undefined && { publishedAt: data.publishedAt }),
+        ...(uniqueGenreSlugs !== undefined && {
+          genres: {
+            set: uniqueGenreSlugs.map((slug) => ({ slug })),
+          },
+        }),
+      },
+      include: {
+        genres: true,
+      },
+    });
 
-  if (embedding) {
-    await persistEmbedding(id, embedding);
-  }
+    if (embedding) {
+      await persistEmbedding(id, embedding, tx, inTransaction);
+    }
 
-  return updatedBook;
+    return updatedBook;
+  };
+
+  return db.$transaction ? db.$transaction(runUpdate) : runUpdate(db);
 };
 
 export const deleteBook = async (id: string) => {

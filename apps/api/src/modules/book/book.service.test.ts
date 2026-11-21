@@ -1,13 +1,25 @@
 import { describe, expect, it, mock } from "bun:test";
 
 import {
+  createBook,
   findSimilarBooks,
   listBooks,
   searchSimilarBooks,
   updateBook,
+  type CreateBookTx,
+  type UpdateBookTx,
   type BookWithGenres,
   type SimilarBook,
 } from "./book.service";
+
+const createTxSpy = <Tx>(
+  runner: <T>(fn: (tx: Tx) => Promise<T>) => Promise<T>,
+) => {
+  const spy = mock(runner);
+  const $transaction = <T>(fn: (tx: Tx) => Promise<T>): Promise<T> =>
+    spy(fn) as Promise<T>;
+  return { spy, $transaction };
+};
 
 const makeBook = (overrides: Partial<BookWithGenres> = {}): BookWithGenres => ({
   id: "book-1",
@@ -156,6 +168,310 @@ describe("book.service", () => {
         orderBy: Record<string, unknown>;
       };
       expect(titleArgs.orderBy).toEqual({ title: "asc" });
+    });
+  });
+
+  describe("createBook", () => {
+    it("deduplicates genreSlugs in a single query, generates embedding before $transaction, and persists book + vector atomically via tx.$executeRaw", async () => {
+      const callOrder: string[] = [];
+      const createdBook = makeBook({
+        id: "new-book-1",
+        genres: [
+          {
+            slug: "ficcao-cientifica",
+            name: "Ficção Científica",
+            createdAt: new Date("2026-01-01T00:00:00.000Z"),
+            updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+          },
+          {
+            slug: "aventura",
+            name: "Aventura",
+            createdAt: new Date("2026-01-01T00:00:00.000Z"),
+            updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+          },
+        ],
+      });
+
+      const findGenresMock = mock(async () => {
+        callOrder.push("genre.findMany");
+        return [
+          { slug: "ficcao-cientifica", name: "Ficção Científica" },
+          { slug: "aventura", name: "Aventura" },
+        ];
+      });
+
+      const genEmbeddingMock = mock(async () => {
+        callOrder.push("generateEmbedding");
+        return [0.11, 0.22, 0.33];
+      });
+
+      let rawContextTag: string | undefined;
+      let capturedSql = "";
+      let capturedValues: unknown[] = [];
+
+      const txBookCreateMock = mock(async () => {
+        callOrder.push("tx.book.create");
+        return createdBook;
+      });
+
+      const fakeTx: CreateBookTx & { contextTag: string } = {
+        contextTag: "tx-bound",
+        book: {
+          create: txBookCreateMock,
+        },
+        async $executeRaw(
+          this: { contextTag?: string },
+          strings: TemplateStringsArray,
+          ...values: unknown[]
+        ) {
+          callOrder.push("tx.$executeRaw");
+          rawContextTag = this?.contextTag;
+          capturedSql = strings.join("?");
+          capturedValues = values;
+          return 1;
+        },
+      };
+
+      const outerBookCreateMock = mock(async () => {
+        throw new Error("Should not call outer prisma.book.create directly");
+      });
+
+      const { spy: transactionMock, $transaction } = createTxSpy<CreateBookTx>(
+        async (fn) => {
+          callOrder.push("$transaction:start");
+          const result = await fn(fakeTx);
+          callOrder.push("$transaction:end");
+          return result;
+        },
+      );
+
+      const result = await createBook(
+        {
+          title: "Duna",
+          author: "Frank Herbert",
+          description: "Épico no planeta Arrakis.",
+          genreSlugs: ["ficcao-cientifica", "ficcao-cientifica", "aventura"],
+        },
+        {
+          prisma: {
+            book: { create: outerBookCreateMock },
+            genre: { findMany: findGenresMock },
+            $transaction,
+          },
+          generateEmbedding: genEmbeddingMock,
+        },
+      );
+
+      expect(result).toEqual(createdBook);
+      expect(findGenresMock).toHaveBeenCalledTimes(1);
+      expect(findGenresMock).toHaveBeenCalledWith({
+        where: { slug: { in: ["ficcao-cientifica", "aventura"] } },
+      });
+      expect(genEmbeddingMock).toHaveBeenCalledTimes(1);
+      expect(
+        (genEmbeddingMock.mock.calls[0] as unknown[])[0] as string,
+      ).toContain("Gêneros: Ficção Científica, Aventura");
+      expect(transactionMock).toHaveBeenCalledTimes(1);
+      expect(outerBookCreateMock).not.toHaveBeenCalled();
+
+      const createArgs = (txBookCreateMock.mock.calls[0] as unknown[])[0] as {
+        data: { genres: { connect: { slug: string }[] } };
+      };
+      expect(createArgs.data.genres.connect).toEqual([
+        { slug: "ficcao-cientifica" },
+        { slug: "aventura" },
+      ]);
+
+      expect(rawContextTag).toBe("tx-bound");
+      expect(capturedSql).toContain('UPDATE "books"');
+      expect(capturedValues).toEqual(["[0.11,0.22,0.33]", "new-book-1"]);
+      expect(callOrder).toEqual([
+        "genre.findMany",
+        "generateEmbedding",
+        "$transaction:start",
+        "tx.book.create",
+        "tx.$executeRaw",
+        "$transaction:end",
+      ]);
+    });
+
+    it("skips genre query when genreSlugs is empty and still creates book and embedding atomically", async () => {
+      const findGenresMock = mock(async () => []);
+      const genEmbeddingMock = mock(async () => [0.5, 0.5]);
+      const saveEmbeddingMock = mock(async () => undefined);
+      const txBookCreateMock = mock(async () =>
+        makeBook({ id: "book-empty-genres", genres: [] }),
+      );
+      const { $transaction } = createTxSpy<CreateBookTx>(async (fn) =>
+        fn({ book: { create: txBookCreateMock } }),
+      );
+
+      const result = await createBook(
+        {
+          title: "Sem Gênero",
+          author: "Autor Teste",
+          genreSlugs: [],
+        },
+        {
+          prisma: {
+            genre: { findMany: findGenresMock },
+            $transaction,
+          },
+          generateEmbedding: genEmbeddingMock,
+          saveBookEmbedding: saveEmbeddingMock,
+        },
+      );
+
+      expect(result.id).toBe("book-empty-genres");
+      expect(findGenresMock).not.toHaveBeenCalled();
+      expect(genEmbeddingMock).toHaveBeenCalledTimes(1);
+      expect(saveEmbeddingMock).toHaveBeenCalledWith("book-empty-genres", [
+        0.5, 0.5,
+      ]);
+    });
+
+    it("aborts before calling generateEmbedding or $transaction when any genreSlug does not exist", async () => {
+      const findGenresMock = mock(async () => [
+        { slug: "ficcao-cientifica", name: "Ficção Científica" },
+      ]);
+      const genEmbeddingMock = mock(async () => [0.1, 0.2]);
+      const { spy: transactionMock, $transaction } = createTxSpy<CreateBookTx>(
+        async (fn) => fn({ book: { create: mock(async () => makeBook()) } }),
+      );
+
+      await expect(
+        createBook(
+          {
+            title: "Livro Inválido",
+            author: "Autor",
+            genreSlugs: ["ficcao-cientifica", "genero-inexistente"],
+          },
+          {
+            prisma: {
+              genre: { findMany: findGenresMock },
+              $transaction,
+            },
+            generateEmbedding: genEmbeddingMock,
+          },
+        ),
+      ).rejects.toThrow("Genre(s) not found: genero-inexistente");
+
+      expect(findGenresMock).toHaveBeenCalledTimes(1);
+      expect(genEmbeddingMock).not.toHaveBeenCalled();
+      expect(transactionMock).not.toHaveBeenCalled();
+    });
+
+    it("propagates generateEmbedding errors without opening $transaction", async () => {
+      const { spy: transactionMock, $transaction } = createTxSpy<CreateBookTx>(
+        async (fn) => fn({ book: { create: mock(async () => makeBook()) } }),
+      );
+
+      await expect(
+        createBook(
+          {
+            title: "Livro",
+            author: "Autor",
+            genreSlugs: [],
+          },
+          {
+            prisma: {
+              genre: { findMany: mock(async () => []) },
+              $transaction,
+            },
+            generateEmbedding: mock(async () => {
+              throw new Error("OpenAI rate limit");
+            }),
+          },
+        ),
+      ).rejects.toThrow("OpenAI rate limit");
+
+      expect(transactionMock).not.toHaveBeenCalled();
+    });
+
+    it("rolls back $transaction and propagates error when saveBookEmbedding fails after tx.book.create", async () => {
+      const committedBooks: BookWithGenres[] = [];
+      let rolledBack = false;
+
+      const { spy: transactionMock, $transaction } = createTxSpy<CreateBookTx>(
+        async (fn) => {
+          const stagedBooks: BookWithGenres[] = [];
+          const tx: CreateBookTx = {
+            book: {
+              create: mock(async () => {
+                const created = makeBook({ id: "orphan-candidate" });
+                stagedBooks.push(created);
+                return created;
+              }),
+            },
+            $executeRaw: mock(async () => {
+              throw new Error("Vector write failed");
+            }),
+          };
+
+          try {
+            const result = await fn(tx);
+            committedBooks.push(...stagedBooks);
+            return result;
+          } catch (err) {
+            rolledBack = true;
+            throw err;
+          }
+        },
+      );
+
+      await expect(
+        createBook(
+          {
+            title: "Livro Órfão",
+            author: "Autor",
+            genreSlugs: [],
+          },
+          {
+            prisma: {
+              genre: { findMany: mock(async () => []) },
+              $transaction,
+            },
+            generateEmbedding: mock(async () => [0.9, 0.1]),
+          },
+        ),
+      ).rejects.toThrow("Vector write failed");
+
+      expect(transactionMock).toHaveBeenCalledTimes(1);
+      expect(rolledBack).toBe(true);
+      expect(committedBooks).toHaveLength(0);
+    });
+
+    it("throws when $transaction supplies tx without $executeRaw and no custom saveBookEmbedding is injected", async () => {
+      const outerExecuteRawMock = mock(async () => 1);
+      const { spy: transactionMock, $transaction } = createTxSpy<CreateBookTx>(
+        async (fn) =>
+          fn({
+            book: {
+              create: mock(async () => makeBook({ id: "missing-raw-tx" })),
+            },
+          }),
+      );
+
+      await expect(
+        createBook(
+          {
+            title: "Sem $executeRaw no tx",
+            author: "Autor",
+            genreSlugs: [],
+          },
+          {
+            prisma: {
+              genre: { findMany: mock(async () => []) },
+              $executeRaw: outerExecuteRawMock,
+              $transaction,
+            },
+            generateEmbedding: mock(async () => [0.3, 0.7]),
+          },
+        ),
+      ).rejects.toThrow("Transaction client must provide $executeRaw");
+
+      expect(transactionMock).toHaveBeenCalledTimes(1);
+      expect(outerExecuteRawMock).not.toHaveBeenCalled();
     });
   });
 
@@ -521,6 +837,195 @@ describe("book.service", () => {
           },
         ),
       ).rejects.toThrow("Database vector write failure");
+    });
+
+    it("generates embedding before $transaction and executes tx.book.update + tx.$executeRaw atomically on semantic change", async () => {
+      const existing = makeBook();
+      const updated = makeBook({ title: "Hereges de Duna" });
+      const callOrder: string[] = [];
+      let rawContextTag: string | undefined;
+
+      const findUniqueMock = mock(async () => {
+        callOrder.push("book.findUnique");
+        return existing;
+      });
+      const findGenresMock = mock(async () => {
+        callOrder.push("genre.findMany");
+        return [{ slug: "aventura", name: "Aventura" }];
+      });
+      const genEmbeddingMock = mock(async () => {
+        callOrder.push("generateEmbedding");
+        return [0.42, 0.58];
+      });
+      const txUpdateMock = mock(async () => {
+        callOrder.push("tx.book.update");
+        return updated;
+      });
+
+      const fakeTx: UpdateBookTx & { contextTag: string } = {
+        contextTag: "update-tx-bound",
+        book: { update: txUpdateMock },
+        async $executeRaw(this: { contextTag?: string }) {
+          callOrder.push("tx.$executeRaw");
+          rawContextTag = this?.contextTag;
+          return 1;
+        },
+      };
+
+      const { $transaction } = createTxSpy<UpdateBookTx>(async (fn) => {
+        callOrder.push("$transaction:start");
+        const res = await fn(fakeTx);
+        callOrder.push("$transaction:end");
+        return res;
+      });
+
+      const result = await updateBook(
+        existing.id,
+        { title: "Hereges de Duna", genreSlugs: ["aventura", "aventura"] },
+        {
+          prisma: {
+            book: {
+              findUnique: findUniqueMock,
+              update: mock(async () => {
+                throw new Error("Should not call outer prisma.book.update");
+              }),
+            },
+            genre: { findMany: findGenresMock },
+            $transaction,
+          },
+          generateEmbedding: genEmbeddingMock,
+        },
+      );
+
+      expect(result).toEqual(updated);
+      expect(rawContextTag).toBe("update-tx-bound");
+      expect(callOrder).toEqual([
+        "book.findUnique",
+        "genre.findMany",
+        "generateEmbedding",
+        "$transaction:start",
+        "tx.book.update",
+        "tx.$executeRaw",
+        "$transaction:end",
+      ]);
+    });
+
+    it("rolls back $transaction on semantic update when vector write fails after tx.book.update", async () => {
+      const existing = makeBook({ title: "Título Original" });
+      let persistedTitle = existing.title;
+      let rolledBack = false;
+
+      const { $transaction } = createTxSpy<UpdateBookTx>(async (fn) => {
+        let stagedTitle = persistedTitle;
+        const tx: UpdateBookTx = {
+          book: {
+            update: mock(async () => {
+              stagedTitle = "Título Não Commitado";
+              return makeBook({ title: stagedTitle });
+            }),
+          },
+          $executeRaw: mock(async () => {
+            throw new Error("Vector update failed");
+          }),
+        };
+
+        try {
+          const res = await fn(tx);
+          persistedTitle = stagedTitle;
+          return res;
+        } catch (err) {
+          rolledBack = true;
+          throw err;
+        }
+      });
+
+      await expect(
+        updateBook(
+          existing.id,
+          { title: "Título Não Commitado" },
+          {
+            prisma: {
+              book: {
+                findUnique: mock(async () => existing),
+                update: mock(async () => existing),
+              },
+              genre: { findMany: mock(async () => []) },
+              $transaction,
+            },
+            generateEmbedding: mock(async () => [0.2, 0.8]),
+          },
+        ),
+      ).rejects.toThrow("Vector update failed");
+
+      expect(rolledBack).toBe(true);
+      expect(persistedTitle).toBe("Título Original");
+    });
+
+    it("aborts updateBook before generateEmbedding and $transaction when genreSlugs contains missing slug", async () => {
+      const existing = makeBook();
+      const genEmbeddingMock = mock(async () => [0.1, 0.2]);
+      const { spy: transactionMock, $transaction } = createTxSpy<UpdateBookTx>(
+        async (fn) => fn({ book: { update: mock(async () => existing) } }),
+      );
+
+      await expect(
+        updateBook(
+          existing.id,
+          { genreSlugs: ["nao-existe"] },
+          {
+            prisma: {
+              book: {
+                findUnique: mock(async () => existing),
+                update: mock(async () => existing),
+              },
+              genre: { findMany: mock(async () => []) },
+              $transaction,
+            },
+            generateEmbedding: genEmbeddingMock,
+          },
+        ),
+      ).rejects.toThrow("Genre(s) not found: nao-existe");
+
+      expect(genEmbeddingMock).not.toHaveBeenCalled();
+      expect(transactionMock).not.toHaveBeenCalled();
+    });
+
+    it("updates metadata inside $transaction without embedding on non-semantic change", async () => {
+      const existing = makeBook({ rating: 4.0 });
+      const updated = makeBook({ rating: 5.0 });
+      const genEmbeddingMock = mock(async () => [0.1, 0.2]);
+      const executeRawMock = mock(async () => 1);
+      const txUpdateMock = mock(async () => updated);
+
+      const { spy: transactionMock, $transaction } = createTxSpy<UpdateBookTx>(
+        async (fn) =>
+          fn({
+            book: { update: txUpdateMock },
+            $executeRaw: executeRawMock,
+          }),
+      );
+
+      const result = await updateBook(
+        existing.id,
+        { rating: 5.0 },
+        {
+          prisma: {
+            book: {
+              findUnique: mock(async () => existing),
+              update: mock(async () => existing),
+            },
+            genre: { findMany: mock(async () => []) },
+            $transaction,
+          },
+          generateEmbedding: genEmbeddingMock,
+        },
+      );
+
+      expect(result).toEqual(updated);
+      expect(transactionMock).toHaveBeenCalledTimes(1);
+      expect(txUpdateMock).toHaveBeenCalledTimes(1);
+      expect(genEmbeddingMock).not.toHaveBeenCalled();
+      expect(executeRawMock).not.toHaveBeenCalled();
     });
   });
 

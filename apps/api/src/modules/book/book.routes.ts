@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 
 import { prisma } from "@/lib/prisma";
+import { adminAuthMiddleware } from "@/middlewares/admin-auth.middleware";
 import { GenreSchema } from "@/modules/genre/genre.routes";
 
 import {
@@ -13,7 +14,21 @@ import {
   reindexBooks,
   updateBook,
   updateBookInputSchema,
+  type BookWithGenres,
 } from "./book.service";
+
+export interface BookRoutesOptions {
+  listBooks?: typeof listBooks;
+  findBookById?: (id: string) => Promise<BookWithGenres | null>;
+  createBook?: typeof createBook;
+  updateBook?: typeof updateBook;
+  deleteBook?: typeof deleteBook;
+  reindexBooks?: typeof reindexBooks;
+}
+
+const unauthorizedResponseSchema = z.object({
+  message: z.string(),
+});
 
 export const PaginationMetaSchema = z.object({
   total: z.number(),
@@ -35,7 +50,23 @@ export const BookSchema = z.object({
   updatedAt: z.date(),
 });
 
-export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
+export const booksRoutes: FastifyPluginAsyncZod<BookRoutesOptions> = async (
+  app,
+  opts,
+) => {
+  const handleListBooks = opts.listBooks ?? listBooks;
+  const handleFindBookById =
+    opts.findBookById ??
+    ((id: string) =>
+      prisma.book.findUnique({
+        where: { id },
+        include: { genres: true },
+      }));
+  const handleCreateBook = opts.createBook ?? createBook;
+  const handleUpdateBook = opts.updateBook ?? updateBook;
+  const handleDeleteBook = opts.deleteBook ?? deleteBook;
+  const handleReindexBooks = opts.reindexBooks ?? reindexBooks;
+
   app.get(
     "/",
     {
@@ -51,7 +82,7 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
       },
     },
     async (req, res) => {
-      const { books, meta } = await listBooks(req.query);
+      const { books, meta } = await handleListBooks(req.query);
 
       return { data: books, meta };
     },
@@ -78,14 +109,7 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
     async (req, res) => {
       const { id } = req.params;
 
-      const book = await prisma.book.findUnique({
-        where: {
-          id,
-        },
-        include: {
-          genres: true,
-        },
-      });
+      const book = await handleFindBookById(id);
 
       if (!book) {
         res.status(404);
@@ -99,18 +123,21 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
   app.post(
     "/",
     {
+      onRequest: [adminAuthMiddleware],
       schema: {
         tags: ["Books"],
+        security: [{ adminApiKey: [] }],
         body: bookInputSchema,
         response: {
           201: z.object({
             data: BookSchema,
           }),
+          401: unauthorizedResponseSchema,
         },
       },
     },
     async (req, res) => {
-      const book = await createBook(req.body);
+      const book = await handleCreateBook(req.body);
 
       res.status(201);
       return { data: book };
@@ -120,8 +147,10 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
   app.put(
     "/:id",
     {
+      onRequest: [adminAuthMiddleware],
       schema: {
         tags: ["Books"],
+        security: [{ adminApiKey: [] }],
         params: z.object({
           id: z.string(),
         }),
@@ -130,6 +159,7 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
           200: z.object({
             data: BookSchema,
           }),
+          401: unauthorizedResponseSchema,
           404: z.object({
             data: z.null(),
           }),
@@ -139,7 +169,7 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
     async (req, res) => {
       const { id } = req.params;
 
-      const book = await updateBook(id, req.body);
+      const book = await handleUpdateBook(id, req.body);
 
       if (!book) {
         res.status(404);
@@ -153,8 +183,10 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
   app.delete(
     "/:id",
     {
+      onRequest: [adminAuthMiddleware],
       schema: {
         tags: ["Books"],
+        security: [{ adminApiKey: [] }],
         params: z.object({
           id: z.string(),
         }),
@@ -162,6 +194,7 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
           200: z.object({
             message: z.string(),
           }),
+          401: unauthorizedResponseSchema,
           404: z.object({
             data: z.null(),
           }),
@@ -171,7 +204,7 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
     async (req, res) => {
       const { id } = req.params;
 
-      const deleted = await deleteBook(id);
+      const deleted = await handleDeleteBook(id);
 
       if (!deleted) {
         res.status(404);
@@ -185,8 +218,10 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
   app.post(
     "/reindex",
     {
+      onRequest: [adminAuthMiddleware],
       schema: {
         tags: ["Books"],
+        security: [{ adminApiKey: [] }],
         body: z.object({
           mode: z.enum(["missing", "all"]).default("missing"),
         }),
@@ -197,13 +232,14 @@ export const booksRoutes: FastifyPluginAsyncZod = async (app) => {
               reindexed: z.number(),
             }),
           }),
+          401: unauthorizedResponseSchema,
         },
       },
     },
     async (req, res) => {
       const { mode } = req.body;
 
-      const reindexed = await reindexBooks(mode);
+      const reindexed = await handleReindexBooks(mode);
 
       return { data: { mode, reindexed } };
     },
