@@ -1,0 +1,44 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [vector, unaccent]
+}
+
+model Book {
+  id           String                       @id @default(uuid())
+  title        String
+  author       String
+  description  String?
+  coverUrl     String?
+  rating       Float?
+  publishedAt  DateTime?
+  embedding    Unsupported("vector(1536)")?
+  searchVector Unsupported("tsvector")?     @map("search_vector")
+
+  genres Genre[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("books")
+}
+
+model Genre {
+  slug      String   @id
+  name      String   @unique
+  books     Book[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("genres")
+}

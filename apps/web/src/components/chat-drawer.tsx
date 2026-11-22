@@ -1,0 +1,783 @@
+import * as React from "react";
+import ReactMarkdown from "react-markdown";
+import { ArrowUp, Sparkles, Square, X } from "lucide-react";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@repo/ui";
+import { useChatSession } from "@/hooks/use-chat-session";
+import { streamChatMessage } from "@/services/chat";
+import { TypingIndicator } from "@/components/typing-indicator";
+import { AiCitationCard } from "@/components/ai-citation-card";
+import type { Book, ChatMessage } from "@/types/api";
+
+const MAX_CHAT_MESSAGE_LENGTH = 2000;
+const CONCURRENT_TURN_ERROR_MESSAGE =
+  "Já existe uma resposta em andamento nesta sessão. Aguarde a conclusão e tente novamente.";
+
+function extractErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) {
+    if (
+      /already in progress|concurrent turn|em andamento nesta sess|\(409\)/i.test(
+        err.message,
+      )
+    ) {
+      return CONCURRENT_TURN_ERROR_MESSAGE;
+    }
+    return err.message;
+  }
+  return "Ocorreu um erro ao comunicar com o assistente.";
+}
+
+const PROMPT_STARTERS = [
+  "Me indique um livro de ficção científica com comédia",
+  "Quais são os livros mais bem avaliados do acervo?",
+  "Quero um livro sobre cosmologia e buracos negros",
+] as const;
+
+const SESSION_EXPIRED_NOTICE =
+  "Sessão expirada após 1h de inatividade — iniciando novo contexto";
+
+function wrapStreamingChildren(children: React.ReactNode): React.ReactNode {
+  return React.Children.map(children, (child, childIndex) => {
+    if (typeof child !== "string") {
+      return child;
+    }
+
+    return child.split(/(\s+)/).map((part, partIndex) => {
+      if (!part) {
+        return null;
+      }
+      if (/^\s+$/.test(part)) {
+        return part;
+      }
+      return (
+        <span
+          key={`${childIndex}-${partIndex}`}
+          className="animate-chat-token-fade"
+        >
+          {part}
+        </span>
+      );
+    });
+  });
+}
+
+const MARKDOWN_COMPONENTS: React.ComponentProps<
+  typeof ReactMarkdown
+>["components"] = {
+  h1: ({ children }) => (
+    <h1 className="mt-3 mb-1.5 first:mt-0 text-[14.5px] font-semibold text-white leading-snug">
+      {children}
+    </h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="mt-3 mb-1.5 first:mt-0 text-[14.5px] font-semibold text-white leading-snug">
+      {children}
+    </h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="mt-3 mb-1.5 first:mt-0 text-[13.5px] font-semibold text-white leading-snug">
+      {children}
+    </h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="mt-3 mb-1.5 first:mt-0 text-[13.5px] font-semibold text-white leading-snug">
+      {children}
+    </h4>
+  ),
+  p: ({ children }) => (
+    <p className="mb-2.5 last:mb-0 leading-[1.5]">{children}</p>
+  ),
+  strong: ({ children }) => (
+    <strong className="font-semibold text-white">{children}</strong>
+  ),
+  em: ({ children }) => (
+    <em className="italic text-[#E4E4E7]">{children}</em>
+  ),
+  ul: ({ children }) => (
+    <ul className="my-2 list-disc pl-4 space-y-1">{children}</ul>
+  ),
+  ol: ({ children }) => (
+    <ol className="my-2 list-decimal pl-4 space-y-1">{children}</ol>
+  ),
+  li: ({ children }) => <li className="leading-relaxed pl-0.5">{children}</li>,
+  code: ({ children }) => (
+    <code className="rounded bg-[#272A34] px-1 py-0.5 font-mono text-[12px] text-[#E4E4E7]">
+      {children}
+    </code>
+  ),
+};
+
+const STREAMING_MARKDOWN_COMPONENTS: React.ComponentProps<
+  typeof ReactMarkdown
+>["components"] = {
+  ...MARKDOWN_COMPONENTS,
+  h1: ({ children }) => (
+    <h1 className="mt-3 mb-1.5 first:mt-0 text-[14.5px] font-semibold text-white leading-snug">
+      {wrapStreamingChildren(children)}
+    </h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="mt-3 mb-1.5 first:mt-0 text-[14.5px] font-semibold text-white leading-snug">
+      {wrapStreamingChildren(children)}
+    </h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="mt-3 mb-1.5 first:mt-0 text-[13.5px] font-semibold text-white leading-snug">
+      {wrapStreamingChildren(children)}
+    </h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="mt-3 mb-1.5 first:mt-0 text-[13.5px] font-semibold text-white leading-snug">
+      {wrapStreamingChildren(children)}
+    </h4>
+  ),
+  p: ({ children }) => (
+    <p className="mb-2.5 last:mb-0 leading-[1.5]">
+      {wrapStreamingChildren(children)}
+    </p>
+  ),
+  strong: ({ children }) => (
+    <strong className="font-semibold text-white">
+      {wrapStreamingChildren(children)}
+    </strong>
+  ),
+  em: ({ children }) => (
+    <em className="italic text-[#E4E4E7]">
+      {wrapStreamingChildren(children)}
+    </em>
+  ),
+  li: ({ children }) => (
+    <li className="leading-relaxed pl-0.5">
+      {wrapStreamingChildren(children)}
+    </li>
+  ),
+  code: ({ children }) => (
+    <code className="rounded bg-[#272A34] px-1 py-0.5 font-mono text-[12px] text-[#E4E4E7]">
+      {wrapStreamingChildren(children)}
+    </code>
+  ),
+};
+
+export interface ChatDrawerProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSelectBook?: (book: Book) => void;
+  initialPrompt?: string;
+}
+
+export function ChatDrawer({
+  isOpen,
+  onClose,
+  initialPrompt = "",
+  onSelectBook,
+}: ChatDrawerProps) {
+  const { touchSession } = useChatSession();
+  const [inputValue, setInputValue] = React.useState(initialPrompt);
+  const [prevPrompt, setPrevPrompt] = React.useState(initialPrompt);
+  const [messages, setMessages] = React.useState<ChatMessage[]>([]);
+  const [isLoading, setIsLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const inputRef = React.useRef<HTMLInputElement>(null);
+  const scrollContainerRef = React.useRef<HTMLDivElement>(null);
+  const messagesEndRef = React.useRef<HTMLDivElement>(null);
+  const abortControllerRef = React.useRef<AbortController | null>(null);
+  const cancelledByUserRef = React.useRef(false);
+  const failedStreamingMessageIdRef = React.useRef<string | null>(null);
+  const focusTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isUserNearBottomRef = React.useRef(true);
+  const scrollCancelRef = React.useRef<(() => void) | null>(null);
+  const isOpenRef = React.useRef(isOpen);
+  const msgSeqRef = React.useRef(0);
+
+  // Sync state with prop change without setState in useEffect
+  if (initialPrompt !== prevPrompt) {
+    setPrevPrompt(initialPrompt);
+    setInputValue(initialPrompt);
+  }
+
+  const clearFocusTimer = React.useCallback(() => {
+    if (focusTimerRef.current !== null) {
+      clearTimeout(focusTimerRef.current);
+      focusTimerRef.current = null;
+    }
+  }, []);
+
+  const cancelScheduledScroll = React.useCallback(() => {
+    if (scrollCancelRef.current) {
+      scrollCancelRef.current();
+      scrollCancelRef.current = null;
+    }
+  }, []);
+
+  const handleBodyScroll = React.useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isUserNearBottomRef.current = distanceFromBottom <= 80;
+  }, []);
+
+  const isStreamingMessage = messages.some((m) => m.isStreaming);
+
+  React.useEffect(() => {
+    return () => cancelScheduledScroll();
+  }, [cancelScheduledScroll]);
+
+  React.useLayoutEffect(() => {
+    if (!isOpen) return;
+    isUserNearBottomRef.current = true;
+    const el = scrollContainerRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [isOpen]);
+
+  React.useEffect(() => {
+    if (!isUserNearBottomRef.current) {
+      return;
+    }
+
+    if (isStreamingMessage) {
+      if (!scrollCancelRef.current) {
+        const syncScroll = () => {
+          scrollCancelRef.current = null;
+          const el = scrollContainerRef.current;
+          if (el && isUserNearBottomRef.current) {
+            el.scrollTop = el.scrollHeight;
+          }
+        };
+
+        if (typeof requestAnimationFrame === "function") {
+          const rafId = requestAnimationFrame(syncScroll);
+          scrollCancelRef.current = () => cancelAnimationFrame(rafId);
+        } else {
+          const timer = setTimeout(syncScroll, 0);
+          scrollCancelRef.current = () => clearTimeout(timer);
+        }
+      }
+      return;
+    }
+
+    cancelScheduledScroll();
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isLoading, error, isStreamingMessage, cancelScheduledScroll]);
+
+  const appendSessionExpiredNotice = React.useCallback(() => {
+    setMessages((prev) => {
+      if (prev.length === 0) {
+        return prev;
+      }
+      const lastMessage = prev[prev.length - 1];
+      if (lastMessage?.isSystemNotice) {
+        return prev;
+      }
+      return [
+        ...prev,
+        {
+          id: `notice-${Date.now()}-${++msgSeqRef.current}`,
+          role: "assistant",
+          content: SESSION_EXPIRED_NOTICE,
+          isSystemNotice: true,
+          createdAt: new Date().toISOString(),
+        },
+      ];
+    });
+  }, []);
+
+  // Keep isOpenRef synchronized, touch session and focus input when drawer opens
+  React.useEffect(() => {
+    isOpenRef.current = isOpen;
+    if (isOpen) {
+      const { expired } = touchSession();
+      if (expired) {
+        appendSessionExpiredNotice();
+      }
+      const timer = setTimeout(() => {
+        if (isOpenRef.current) {
+          inputRef.current?.focus();
+        }
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [isOpen, touchSession, appendSessionExpiredNotice]);
+
+  // Abort pending request and clear focus timer when drawer closes or unmounts
+  React.useEffect(() => {
+    if (!isOpen) {
+      clearFocusTimer();
+      cancelledByUserRef.current = false;
+      abortControllerRef.current?.abort();
+    }
+    return () => {
+      clearFocusTimer();
+      cancelledByUserRef.current = false;
+      abortControllerRef.current?.abort();
+    };
+  }, [isOpen, clearFocusTimer]);
+
+  const handleStopGeneration = () => {
+    if (!isLoading) return;
+    cancelledByUserRef.current = true;
+    abortControllerRef.current?.abort();
+  };
+
+  const handleStarterClick = (starter: string) => {
+    setInputValue(starter);
+    inputRef.current?.focus();
+  };
+
+  const handleSendMessage = async (textToSend: string, isRetry = false) => {
+    const trimmed = textToSend.trim();
+    if (!trimmed || isLoading) return;
+
+    if (trimmed.length > MAX_CHAT_MESSAGE_LENGTH) {
+      setError("A mensagem não pode ultrapassar 2000 caracteres.");
+      return;
+    }
+
+    const { sessionId: activeSessionId, expired } = touchSession();
+    if (expired) {
+      appendSessionExpiredNotice();
+    }
+    isUserNearBottomRef.current = true;
+    if (!isRetry) {
+      setInputValue("");
+    }
+    setError(null);
+
+    if (isRetry && failedStreamingMessageIdRef.current) {
+      const failedId = failedStreamingMessageIdRef.current;
+      failedStreamingMessageIdRef.current = null;
+      setMessages((prev) => prev.filter((m) => m.id !== failedId));
+    } else if (!isRetry) {
+      failedStreamingMessageIdRef.current = null;
+      const userMessage: ChatMessage = {
+        id: `user-${Date.now()}-${++msgSeqRef.current}`,
+        role: "user",
+        content: trimmed,
+        createdAt: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, userMessage]);
+    }
+
+    setIsLoading(true);
+
+    cancelledByUserRef.current = false;
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    const assistantMsgId = `assistant-${Date.now()}-${++msgSeqRef.current}`;
+    let hasReceivedDelta = false;
+
+    const handleAbortedStream = () => {
+      const isCurrentController = abortControllerRef.current === controller;
+      if (hasReceivedDelta) {
+        if (isCurrentController) {
+          cancelledByUserRef.current = false;
+        }
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId ? { ...m, isStreaming: false } : m,
+          ),
+        );
+      } else if (isCurrentController && cancelledByUserRef.current) {
+        cancelledByUserRef.current = false;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `cancelled-${Date.now()}-${++msgSeqRef.current}`,
+            role: "assistant",
+            content: "Solicitação encerrada.",
+            isCancelled: true,
+            createdAt: new Date().toISOString(),
+          },
+        ]);
+      }
+    };
+
+    try {
+      const response = await streamChatMessage(
+        {
+          message: trimmed,
+          sessionId: activeSessionId,
+        },
+        {
+          signal: controller.signal,
+          onDelta: (deltaContent) => {
+            if (controller.signal.aborted || !deltaContent) {
+              return;
+            }
+
+            if (!hasReceivedDelta) {
+              if (!deltaContent.trim()) {
+                return;
+              }
+              hasReceivedDelta = true;
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: assistantMsgId,
+                  role: "assistant",
+                  content: deltaContent,
+                  isStreaming: true,
+                  createdAt: new Date().toISOString(),
+                },
+              ]);
+              return;
+            }
+
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantMsgId
+                  ? { ...m, content: `${m.content}${deltaContent}` }
+                  : m,
+              ),
+            );
+          },
+        },
+      );
+
+      if (controller.signal.aborted) {
+        handleAbortedStream();
+        return;
+      }
+
+      const replyContent =
+        response.data.modelReply?.trim() ||
+        "Não consegui formular uma recomendação para este pedido. Poderia reformular a pergunta?";
+
+      setMessages((prev) => {
+        const exists = prev.some((m) => m.id === assistantMsgId);
+        if (exists) {
+          return prev.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  content: replyContent,
+                  books: response.data.books,
+                  isStreaming: false,
+                }
+              : m,
+          );
+        }
+        return [
+          ...prev,
+          {
+            id: assistantMsgId,
+            role: "assistant",
+            content: replyContent,
+            books: response.data.books,
+            isStreaming: false,
+            createdAt: new Date().toISOString(),
+          },
+        ];
+      });
+      touchSession();
+    } catch (err: unknown) {
+      const isAborted =
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError");
+
+      if (isAborted) {
+        handleAbortedStream();
+        return;
+      }
+
+      const isCurrentController = abortControllerRef.current === controller;
+      if (hasReceivedDelta) {
+        if (isCurrentController) {
+          failedStreamingMessageIdRef.current = assistantMsgId;
+        }
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId ? { ...m, isStreaming: false } : m,
+          ),
+        );
+      }
+
+      if (isCurrentController) {
+        setError(extractErrorMessage(err));
+      }
+    } finally {
+      if (abortControllerRef.current === controller) {
+        setIsLoading(false);
+        clearFocusTimer();
+        if (isOpenRef.current) {
+          focusTimerRef.current = setTimeout(() => {
+            focusTimerRef.current = null;
+            if (isOpenRef.current) {
+              inputRef.current?.focus();
+            }
+          }, 50);
+        }
+      }
+    }
+  };
+
+  const handleRetry = () => {
+    if (isLoading) return;
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+    if (!lastUserMsg) return;
+
+    handleSendMessage(lastUserMsg.content, true);
+  };
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      handleSendMessage(inputValue);
+    }
+  };
+
+  const handleSend = (event: React.FormEvent) => {
+    event.preventDefault();
+    handleSendMessage(inputValue);
+  };
+
+  return (
+    <Sheet open={isOpen} onOpenChange={(open) => !open && onClose()}>
+      <SheetContent
+        side="right"
+        hideCloseButton
+        className="flex h-full w-[420px] max-w-[95vw] flex-col justify-between border-l border-[#272A34] bg-[#14161B] p-0 text-[#F4F4F6] shadow-2xl"
+      >
+        {/* Chat Header */}
+        <SheetHeader className="flex shrink-0 flex-row items-center justify-between border-b border-[#272A34] p-4 sm:px-6">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-8 w-8 items-center justify-center rounded-[8px] bg-[#241C3E] text-[#7C3AED]">
+              <Sparkles className="h-4 w-4" aria-hidden="true" />
+            </div>
+            <div className="flex flex-col text-left">
+              <SheetTitle className="font-serif text-[18px] font-semibold text-[#F4F4F6] leading-tight">
+                Assistente Literário
+              </SheetTitle>
+              <SheetDescription className="text-[12px] text-[#A1A1AA]">
+                Consultor do acervo · IA
+              </SheetDescription>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Fechar assistente"
+            className="cursor-pointer rounded-full p-2 text-[#A1A1AA] transition-colors hover:bg-[#1C1F26] hover:text-[#F4F4F6] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
+        </SheetHeader>
+
+        {/* Chat Body (Scrollable) */}
+        <div
+          ref={scrollContainerRef}
+          data-testid="chat-scroll-container"
+          onScroll={handleBodyScroll}
+          className="flex flex-1 min-h-0 flex-col gap-4 overflow-y-auto p-4 sm:p-6"
+        >
+          {/* Welcome Message Bubble */}
+          <div className="rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-4 shadow-sm">
+            <p className="font-ui text-[13.5px] leading-[1.55] text-[#F4F4F6]">
+              Olá! Sou o consultor literário do Librarium e conheço todo o
+              acervo da livraria — títulos, sinopses, avaliações e temas. Me diga
+              o que você está com vontade de ler e eu encontro a leitura certa
+              para você.
+            </p>
+          </div>
+
+          {/* Starters Section (when no messages yet) */}
+          {messages.length === 0 && (
+            <div className="flex flex-col gap-2.5">
+              <span className="font-ui text-[10px] font-semibold uppercase tracking-wider text-[#A1A1AA]">
+                Sugestões para começar
+              </span>
+              <div className="flex flex-col gap-2">
+                {PROMPT_STARTERS.map((starter) => (
+                  <button
+                    key={starter}
+                    type="button"
+                    onClick={() => handleStarterClick(starter)}
+                    className="w-full cursor-pointer rounded-[10px] border border-[#272A34] bg-[#14161B] p-3 text-left font-ui text-[12.5px] leading-snug text-[#F4F4F6] transition-colors hover:border-[#3A3E4A] hover:bg-[#1C1F26] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
+                  >
+                    {starter}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Messages List */}
+          {messages.map((message) => {
+            if (message.isSystemNotice) {
+              return (
+                <div
+                  key={message.id}
+                  role="status"
+                  className="flex items-center gap-3 py-1"
+                >
+                  <div className="h-px flex-1 bg-[#272A34]" />
+                  <span className="font-ui text-[11px] text-[#A1A1AA] text-center">
+                    {message.content}
+                  </span>
+                  <div className="h-px flex-1 bg-[#272A34]" />
+                </div>
+              );
+            }
+
+            if (message.role === "user") {
+              return (
+                <div key={message.id} className="flex justify-end">
+                  <div className="max-w-[85%] rounded-[14px_14px_4px_14px] bg-[#7C3AED] px-3.5 py-2.5 shadow-sm">
+                    <p className="font-ui text-[13.5px] leading-[1.45] text-white whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                      {message.content}
+                    </p>
+                  </div>
+                </div>
+              );
+            }
+
+            if (message.isCancelled) {
+              return (
+                <div key={message.id} className="flex items-center gap-2.5">
+                  <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] border border-[#272A34] bg-[#14161B] text-[#A1A1AA]">
+                    <Square className="h-[10px] w-[10px]" aria-hidden="true" />
+                  </div>
+                  <p className="font-ui text-[12.5px] italic text-[#A1A1AA]">
+                    {message.content}
+                  </p>
+                </div>
+              );
+            }
+
+            return (
+              <div key={message.id} className="flex items-start gap-2.5">
+                <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#7C3AED] text-white mt-0.5">
+                  <Sparkles className="h-[13px] w-[13px]" aria-hidden="true" />
+                </div>
+                <div
+                  aria-busy={message.isStreaming ? "true" : undefined}
+                  className="flex flex-1 flex-col gap-2.5 rounded-[4px_14px_14px_14px] border border-[#272A34] bg-[#1C1F26] p-3.5 shadow-sm"
+                >
+                  <div
+                    aria-live="polite"
+                    className="font-ui text-[13.5px] leading-[1.5] text-[#F4F4F6] break-words [overflow-wrap:anywhere]"
+                  >
+                    <ReactMarkdown
+                      components={
+                        message.isStreaming
+                          ? STREAMING_MARKDOWN_COMPONENTS
+                          : MARKDOWN_COMPONENTS
+                      }
+                    >
+                      {message.content}
+                    </ReactMarkdown>
+                  </div>
+
+                  {/* Rich Cited Book Cards */}
+                  {!message.isStreaming &&
+                    message.books &&
+                    message.books.length > 0 && (
+                      <div className="flex flex-col gap-2 pt-2.5 border-t border-[#272A34]/60">
+                        {message.books.map((citedBook) => (
+                          <AiCitationCard
+                            key={citedBook.id}
+                            book={citedBook}
+                            onSelect={onSelectBook}
+                          />
+                        ))}
+                      </div>
+                    )}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Typing Indicator while waiting for first streamed token */}
+          {isLoading && !isStreamingMessage && (
+            <div className="flex items-start gap-2.5">
+              <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-[#7C3AED] text-white mt-0.5">
+                <Sparkles className="h-[13px] w-[13px]" aria-hidden="true" />
+              </div>
+              <TypingIndicator />
+            </div>
+          )}
+
+          {/* Error Banner with Retry */}
+          {error && (
+            <div className="flex items-start gap-2.5">
+              <div className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-[8px] bg-red-500/20 text-red-400 mt-0.5">
+                <X className="h-[13px] w-[13px]" aria-hidden="true" />
+              </div>
+              <div
+                role="alert"
+                className="flex flex-1 flex-col gap-2 rounded-[4px_14px_14px_14px] border border-red-500/30 bg-red-950/20 p-3.5 shadow-sm text-left"
+              >
+                <p className="font-ui text-[13px] text-red-200">
+                  {error}
+                </p>
+                <button
+                  type="button"
+                  onClick={handleRetry}
+                  className="self-start cursor-pointer rounded-[8px] border border-red-500/40 bg-red-900/40 px-3 py-1.5 font-ui text-[12px] font-medium text-red-100 transition-colors hover:bg-red-900/60"
+                >
+                  Tentar novamente
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Anchor to scroll */}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Chat Footer */}
+        <div className="flex shrink-0 flex-col gap-2 border-t border-[#272A34] bg-[#14161B] p-4 sm:p-5">
+          <form
+            onSubmit={handleSend}
+            className="flex items-center gap-2"
+          >
+            <input
+              ref={inputRef}
+              type="text"
+              maxLength={MAX_CHAT_MESSAGE_LENGTH}
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              onKeyDown={handleKeyDown}
+              aria-label="Mensagem para o assistente literário"
+              placeholder="Pergunte sobre o acervo..."
+              className="flex-1 rounded-[12px] border border-[#272A34] bg-[#0C0D10] px-3.5 py-2.5 text-[13.5px] text-[#F4F4F6] placeholder:text-[#71717A] dark:placeholder:text-[#A1A1AA] outline-none transition-colors focus:border-[#7C3AED] focus:ring-1 focus:ring-[#7C3AED]"
+            />
+            {isLoading ? (
+              <button
+                type="button"
+                onClick={handleStopGeneration}
+                aria-label="Interromper resposta"
+                className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-[10px] bg-[#272A34] text-[#F4F4F6] transition-colors hover:bg-[#3A3E4A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
+              >
+                <Square className="h-3.5 w-3.5 fill-current" aria-hidden="true" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!inputValue.trim()}
+                aria-label="Enviar mensagem"
+                className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-[10px] bg-[#7C3AED] text-white transition-colors hover:bg-[#6D28D9] disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
+              >
+                <ArrowUp className="h-4 w-4 stroke-[2.5]" aria-hidden="true" />
+              </button>
+            )}
+          </form>
+
+          <p className="text-center font-ui text-[10px] text-[#A1A1AA]">
+            Recomendações baseadas no acervo real do Librarium.
+          </p>
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}

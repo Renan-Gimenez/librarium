@@ -20,5 +20,9 @@
   "workspaces": [
     "apps/*",
     "packages/*"
-  ]
+  ],
+  "dependencies": {
+    "@fastify/swagger": "^9.7.0",
+    "@scalar/fastify-api-reference": "^1.62.4"
+  }
 }

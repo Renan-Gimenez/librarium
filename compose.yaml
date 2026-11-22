@@ -1,0 +1,26 @@
+services:
+  librarium-pg:
+    image: pgvector/pgvector:pg17
+    restart: always
+    environment:
+      - POSTGRES_USER=dev
+      - POSTGRES_PASSWORD=dev
+      - POSTGRES_DB=librarium
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+
+  librarium-redis:
+    image: bitnami/redis:latest
+    restart: always
+    environment:
+      - ALLOW_EMPTY_PASSWORD=yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/bitnami/redis/data
+
+volumes:
+  pgvector_data:
+  redis_data:
