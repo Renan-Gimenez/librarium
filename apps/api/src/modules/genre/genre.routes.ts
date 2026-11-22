@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 
 import { prisma } from "@/lib/prisma";
+import { adminAuthMiddleware } from "@/middlewares/admin-auth.middleware";
 
 export const GenreSchema = z.object({
   slug: z.string(),
@@ -10,7 +11,37 @@ export const GenreSchema = z.object({
   updatedAt: z.date(),
 });
 
-export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
+export type GenreRecord = z.infer<typeof GenreSchema>;
+
+export interface GenreRoutesOptions {
+  prisma?: {
+    genre: {
+      findMany: (args: { orderBy: { name: "asc" } }) => Promise<GenreRecord[]>;
+      findUnique: (args: {
+        where: { slug: string };
+      }) => Promise<GenreRecord | null>;
+      create: (args: {
+        data: { slug: string; name: string };
+      }) => Promise<GenreRecord>;
+      update: (args: {
+        where: { slug: string };
+        data: { name: string };
+      }) => Promise<GenreRecord>;
+      delete: (args: { where: { slug: string } }) => Promise<GenreRecord>;
+    };
+  };
+}
+
+const unauthorizedResponseSchema = z.object({
+  message: z.string(),
+});
+
+export const genresRoutes: FastifyPluginAsyncZod<GenreRoutesOptions> = async (
+  app,
+  opts,
+) => {
+  const db = opts.prisma ?? prisma;
+
   app.get(
     "/",
     {
@@ -24,7 +55,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
       },
     },
     async (req, res) => {
-      const genres = await prisma.genre.findMany({
+      const genres = await db.genre.findMany({
         orderBy: {
           name: "asc",
         },
@@ -37,8 +68,10 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
   app.post(
     "/",
     {
+      onRequest: [adminAuthMiddleware],
       schema: {
         tags: ["Genres"],
+        security: [{ adminApiKey: [] }],
         body: z.object({
           slug: z
             .string()
@@ -54,6 +87,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
           201: z.object({
             data: GenreSchema,
           }),
+          401: unauthorizedResponseSchema,
           409: z.object({
             message: z.string(),
           }),
@@ -63,7 +97,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
     async (req, res) => {
       const { slug, name } = req.body;
 
-      const existingGenre = await prisma.genre.findUnique({
+      const existingGenre = await db.genre.findUnique({
         where: { slug },
       });
 
@@ -72,7 +106,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
         return { message: `Genre with slug "${slug}" already exists.` };
       }
 
-      const genre = await prisma.genre.create({
+      const genre = await db.genre.create({
         data: {
           slug,
           name,
@@ -105,7 +139,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
     async (req, res) => {
       const { slug } = req.params;
 
-      const genre = await prisma.genre.findUnique({
+      const genre = await db.genre.findUnique({
         where: { slug },
       });
 
@@ -121,8 +155,10 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
   app.put(
     "/:slug",
     {
+      onRequest: [adminAuthMiddleware],
       schema: {
         tags: ["Genres"],
+        security: [{ adminApiKey: [] }],
         params: z.object({
           slug: z.string(),
         }),
@@ -133,6 +169,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
           200: z.object({
             data: GenreSchema,
           }),
+          401: unauthorizedResponseSchema,
           404: z.object({
             data: z.null(),
           }),
@@ -143,7 +180,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
       const { slug } = req.params;
       const { name } = req.body;
 
-      const existingGenre = await prisma.genre.findUnique({
+      const existingGenre = await db.genre.findUnique({
         where: { slug },
       });
 
@@ -152,7 +189,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
         return { data: null };
       }
 
-      const updatedGenre = await prisma.genre.update({
+      const updatedGenre = await db.genre.update({
         where: { slug },
         data: { name },
       });
@@ -164,8 +201,10 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
   app.delete(
     "/:slug",
     {
+      onRequest: [adminAuthMiddleware],
       schema: {
         tags: ["Genres"],
+        security: [{ adminApiKey: [] }],
         params: z.object({
           slug: z.string(),
         }),
@@ -173,6 +212,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
           200: z.object({
             message: z.string(),
           }),
+          401: unauthorizedResponseSchema,
           404: z.object({
             data: z.null(),
           }),
@@ -182,7 +222,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
     async (req, res) => {
       const { slug } = req.params;
 
-      const existingGenre = await prisma.genre.findUnique({
+      const existingGenre = await db.genre.findUnique({
         where: { slug },
       });
 
@@ -191,7 +231,7 @@ export const genresRoutes: FastifyPluginAsyncZod = async (app) => {
         return { data: null };
       }
 
-      await prisma.genre.delete({
+      await db.genre.delete({
         where: { slug },
       });
 

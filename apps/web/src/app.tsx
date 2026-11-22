@@ -24,12 +24,15 @@ export function App() {
   >();
   const [sortBy, setSortBy] = React.useState<BookSortBy>("createdAt");
   const [sortOrder, setSortOrder] = React.useState<SortOrder>("desc");
+  const [hasExplicitSort, setHasExplicitSort] = React.useState(false);
   const [minRating, setMinRating] = React.useState<number | undefined>();
   const [page, setPage] = React.useState(1);
 
   // Fetch genres from API
   const { data: genresData, isLoading: isLoadingGenres } = useGenres();
   const genres = genresData?.data || [];
+
+  const trimmedSearch = debouncedSearch.trim() || undefined;
 
   // Fetch books from API with active filters and pagination
   const {
@@ -38,10 +41,10 @@ export function App() {
     isError: isErrorBooks,
     refetch: refetchBooks,
   } = useBooks({
-    search: debouncedSearch.trim() || undefined,
+    search: trimmedSearch,
     genre: selectedGenre,
     minRating,
-    sortBy,
+    sortBy: trimmedSearch && !hasExplicitSort ? undefined : sortBy,
     order: sortOrder,
     page,
     limit: PAGE_LIMIT,
@@ -70,6 +73,7 @@ export function App() {
   const handleSortChange = (newSortBy: BookSortBy, newOrder: SortOrder) => {
     setSortBy(newSortBy);
     setSortOrder(newOrder);
+    setHasExplicitSort(true);
     setPage(1);
   };
 
@@ -84,6 +88,7 @@ export function App() {
     setMinRating(undefined);
     setSortBy("createdAt");
     setSortOrder("desc");
+    setHasExplicitSort(false);
     setPage(1);
   };
 
@@ -158,6 +163,7 @@ export function App() {
           book={selectedBook}
           isOpen={Boolean(selectedBook)}
           onClose={() => setSelectedBook(null)}
+          onSelectBook={handleSelectBook}
           onAskAI={(book) => {
             setSelectedBook(null);
             setChatInitialPrompt(

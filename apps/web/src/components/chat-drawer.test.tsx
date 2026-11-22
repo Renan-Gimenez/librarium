@@ -3,6 +3,11 @@ import { describe, expect, it, mock, spyOn } from "bun:test";
 import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ChatDrawer } from "./chat-drawer";
 import * as chatService from "@/services/chat";
+import {
+  CHAT_SESSION_EXPIRY_MS,
+  CHAT_SESSION_STORAGE_KEY,
+  saveSession,
+} from "@/hooks/use-chat-session";
 
 const EXPECTED_STARTERS = [
   "Me indique um livro de ficção científica com comédia",
@@ -931,6 +936,200 @@ describe("ChatDrawer Component", () => {
       } else {
         Reflect.deleteProperty(HTMLElement.prototype, "scrollTop");
       }
+      sendSpy.mockRestore();
+    }
+  });
+
+  it("uses new sessionId synchronously and shows single expiration divider when session expires with visible messages", async () => {
+    localStorage.clear();
+    const expiredId = "expired-session-1111";
+    saveSession({ sessionId: expiredId, lastActiveAt: Date.now() });
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockResolvedValue({
+      data: {
+        userMessage: "Segunda mensagem",
+        modelReply: "Nova resposta no novo contexto.",
+      },
+      meta: {
+        usage: { promptTokens: 5, completionTokens: 5, totalTokens: 10 },
+      },
+    });
+
+    try {
+      const { rerender } = render(
+        <ChatDrawer isOpen={true} onClose={() => {}} />,
+      );
+
+      // 1st message under active session
+      const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+      fireEvent.change(input, { target: { value: "Primeira mensagem" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+      await waitFor(() => {
+        expect(screen.getAllByText("Nova resposta no novo contexto.").length).toBe(1);
+      });
+      expect(sendSpy.mock.calls[0]?.[0].sessionId).toBe(expiredId);
+
+      // Simulate >1h inactivity expiration in localStorage while drawer stays mounted
+      saveSession({
+        sessionId: expiredId,
+        lastActiveAt: Date.now() - (CHAT_SESSION_EXPIRY_MS + 5000),
+      });
+
+      // Reopen drawer -> should show 1 divider
+      await act(async () => {
+        rerender(<ChatDrawer isOpen={false} onClose={() => {}} />);
+      });
+      await act(async () => {
+        rerender(<ChatDrawer isOpen={true} onClose={() => {}} />);
+      });
+
+      const noticeText =
+        "Sessão expirada após 1h de inatividade — iniciando novo contexto";
+      expect(screen.getAllByText(noticeText).length).toBe(1);
+
+      // Expire again & reopen again -> must NOT duplicate consecutive dividers
+      const currentRaw = localStorage.getItem(CHAT_SESSION_STORAGE_KEY);
+      const currentSession = JSON.parse(currentRaw!) as { sessionId: string };
+      saveSession({
+        sessionId: currentSession.sessionId,
+        lastActiveAt: Date.now() - (CHAT_SESSION_EXPIRY_MS + 5000),
+      });
+
+      await act(async () => {
+        rerender(<ChatDrawer isOpen={false} onClose={() => {}} />);
+      });
+      await act(async () => {
+        rerender(<ChatDrawer isOpen={true} onClose={() => {}} />);
+      });
+
+      expect(screen.getAllByText(noticeText).length).toBe(1);
+
+      // Send message right after -> must send the renewed sessionId (not expiredId)
+      const renewedRaw = localStorage.getItem(CHAT_SESSION_STORAGE_KEY);
+      const renewedSession = JSON.parse(renewedRaw!) as { sessionId: string };
+      expect(renewedSession.sessionId).not.toBe(expiredId);
+
+      fireEvent.change(
+        screen.getByPlaceholderText("Pergunte sobre o acervo..."),
+        { target: { value: "Segunda mensagem" } },
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+      await waitFor(() => {
+        expect(sendSpy).toHaveBeenCalledTimes(2);
+      });
+      expect(sendSpy.mock.calls[1]?.[0].sessionId).toBe(
+        renewedSession.sessionId,
+      );
+    } finally {
+      sendSpy.mockRestore();
+    }
+  });
+
+  it("does not display expiration divider when drawer opens with no visible messages", () => {
+    localStorage.clear();
+    saveSession({
+      sessionId: "expired-empty-session",
+      lastActiveAt: Date.now() - (CHAT_SESSION_EXPIRY_MS + 5000),
+    });
+
+    render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+    expect(
+      screen.queryByText(
+        "Sessão expirada após 1h de inatividade — iniciando novo contexto",
+      ),
+    ).toBeNull();
+  });
+
+  it("renews sessionId and renders single expiration divider on send when session expires while drawer stays open", async () => {
+    localStorage.clear();
+    const initialId = "open-drawer-initial-session";
+    saveSession({ sessionId: initialId, lastActiveAt: Date.now() });
+
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockResolvedValue({
+      data: {
+        userMessage: "Mensagem",
+        modelReply: "Resposta",
+      },
+      meta: {
+        usage: { promptTokens: 5, completionTokens: 5, totalTokens: 10 },
+      },
+    });
+
+    try {
+      render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+      const input = screen.getByPlaceholderText(
+        "Pergunte sobre o acervo...",
+      ) as HTMLInputElement;
+      expect(input.maxLength).toBe(2000);
+
+      fireEvent.change(input, { target: { value: "Primeira" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+      await waitFor(() => {
+        expect(sendSpy).toHaveBeenCalledTimes(1);
+      });
+      expect(sendSpy.mock.calls[0]?.[0].sessionId).toBe(initialId);
+
+      // Expire while drawer remains open (no close/reopen rerender)
+      saveSession({
+        sessionId: initialId,
+        lastActiveAt: Date.now() - (CHAT_SESSION_EXPIRY_MS + 10000),
+      });
+
+      fireEvent.change(input, { target: { value: "Segunda após 1h" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+      await waitFor(() => {
+        expect(sendSpy).toHaveBeenCalledTimes(2);
+      });
+
+      const secondSessionId = sendSpy.mock.calls[1]?.[0].sessionId;
+      expect(secondSessionId).toBeDefined();
+      expect(secondSessionId).not.toBe(initialId);
+
+      const noticeText =
+        "Sessão expirada após 1h de inatividade — iniciando novo contexto";
+      expect(screen.getAllByText(noticeText).length).toBe(1);
+    } finally {
+      sendSpy.mockRestore();
+    }
+  });
+
+  it("blocks messages over 2000 characters and displays friendly message on 409 Conflict", async () => {
+    localStorage.clear();
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockRejectedValue(
+      new Error("A chat request is already in progress for this session."),
+    );
+
+    try {
+      render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+      const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+
+      // Over 2000 characters blocked client-side before calling service
+      fireEvent.change(input, { target: { value: "a".repeat(2001) } });
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      expect(sendSpy).not.toHaveBeenCalled();
+      expect(
+        screen.getByText("A mensagem não pode ultrapassar 2000 caracteres."),
+      ).toBeDefined();
+
+      // Valid message receiving 409 shows friendly pt-BR conflict message
+      fireEvent.change(input, { target: { value: "Pergunta válida" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+      await waitFor(() => {
+        expect(
+          screen.getByText(
+            "Já existe uma resposta em andamento nesta sessão. Aguarde a conclusão e tente novamente.",
+          ),
+        ).toBeDefined();
+      });
+    } finally {
       sendSpy.mockRestore();
     }
   });

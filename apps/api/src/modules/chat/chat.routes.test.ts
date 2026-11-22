@@ -11,7 +11,7 @@ import {
 } from "fastify-type-provider-zod";
 import { APIUserAbortError } from "openai";
 
-import { AppError, errorHandler } from "@/errors";
+import { AppError, ConflictError, errorHandler } from "@/errors";
 
 import {
   chatRoutes,
@@ -160,10 +160,13 @@ describe("chat.routes", () => {
 
     expect(response.statusCode).toBe(200);
     expect(processMessageMock).toHaveBeenCalledTimes(1);
-    expect(processMessageMock).toHaveBeenCalledWith({
-      token: "session-token-abc",
-      message: "Quero livros sobre solidão no espaço e ficção",
-    });
+    expect(processMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        token: "session-token-abc",
+        message: "Quero livros sobre solidão no espaço e ficção",
+        logger: expect.any(Object),
+      }),
+    );
 
     const body = response.json() as ProcessChatMessageResult;
     expect(body).toEqual(serviceResult);
@@ -174,6 +177,62 @@ describe("chat.routes", () => {
       promptTokens: 320,
       completionTokens: 45,
       totalTokens: 365,
+    });
+
+    await app.close();
+  });
+
+  it("returns 400 when message exceeds 2000 characters after trim and accepts exactly 2000", async () => {
+    const processMessageMock = mock(async (input) => ({
+      data: {
+        userMessage: input.message,
+        modelReply: "Ok",
+        books: [],
+      },
+      meta: { usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
+    }));
+    const app = buildTestApp({ processMessage: processMessageMock });
+
+    const tooLongRes = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      headers: { authorization: "Bearer session-token-len" },
+      payload: { message: `  ${"a".repeat(2001)}  ` },
+    });
+
+    expect(tooLongRes.statusCode).toBe(400);
+    expect(processMessageMock).not.toHaveBeenCalled();
+
+    const exactRes = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      headers: { authorization: "Bearer session-token-len" },
+      payload: { message: `  ${"a".repeat(2000)}  ` },
+    });
+
+    expect(exactRes.statusCode).toBe(200);
+    expect(processMessageMock).toHaveBeenCalledTimes(1);
+
+    await app.close();
+  });
+
+  it("returns 409 Conflict when processMessage throws ConflictError", async () => {
+    const processMessageMock = mock(async () => {
+      throw new ConflictError("A chat request is already in progress for this session.");
+    });
+    const app = buildTestApp({ processMessage: processMessageMock });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      headers: { authorization: "Bearer session-conflict" },
+      payload: { message: "Olá" },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      statusCode: 409,
+      error: "Conflict",
     });
 
     await app.close();
@@ -223,6 +282,103 @@ describe("chat.routes", () => {
       });
       expect(streamMock).not.toHaveBeenCalled();
 
+      await app.close();
+    });
+
+    it("returns 400 JSON when stream message exceeds 2000 characters after trim without hijacking", async () => {
+      const streamMock = mock(async () => {
+        throw new Error("Should not execute stream handler with >2000 chars");
+      });
+      const app = buildTestApp({ streamMessage: streamMock });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/chat/stream",
+        headers: {
+          authorization: "Bearer session-token-stream-len",
+        },
+        payload: { message: "x".repeat(2001) },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.headers["content-type"]).toContain("application/json");
+      expect(streamMock).not.toHaveBeenCalled();
+
+      const exact2000Mock = mock(async (input) => {
+        input.onStreamStart?.();
+        return {
+          data: {
+            userMessage: input.message,
+            modelReply: "Ok 2000",
+            books: [],
+          },
+          meta: {
+            usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+          },
+        };
+      });
+      const appExact = buildTestApp({ streamMessage: exact2000Mock });
+      const exactRes = await appExact.inject({
+        method: "POST",
+        url: "/api/chat/stream",
+        headers: {
+          authorization: "Bearer session-token-stream-len",
+        },
+        payload: { message: `  ${"x".repeat(2000)}  ` },
+      });
+
+      expect(exactRes.statusCode).toBe(200);
+      expect(exactRes.headers["content-type"]).toContain("text/event-stream");
+      expect(exact2000Mock).toHaveBeenCalledTimes(1);
+
+      await appExact.close();
+      await app.close();
+    });
+
+    it("returns 409 JSON without hijacking when streamMessage throws ConflictError pre-stream and starts SSE stream when onStreamStart fires before deltas", async () => {
+      const streamMock = mock(async () => {
+        throw new ConflictError("Concurrent turn in progress");
+      });
+      const app = buildTestApp({ streamMessage: streamMock });
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/chat/stream",
+        headers: {
+          authorization: "Bearer session-stream-conflict",
+        },
+        payload: { message: "Olá" },
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.headers["content-type"]).toContain("application/json");
+      expect(response.json()).toEqual({
+        statusCode: 409,
+        error: "Conflict",
+        message: "Concurrent turn in progress",
+      });
+
+      const appStart = buildTestApp({
+        streamMessage: mock(async (input) => {
+          input.onStreamStart?.();
+          throw new ConflictError("Late 409 after stream started");
+        }),
+      });
+      const resAfterStart = await appStart.inject({
+        method: "POST",
+        url: "/api/chat/stream",
+        headers: {
+          authorization: "Bearer session-stream-started",
+        },
+        payload: { message: "Olá" },
+      });
+
+      expect(resAfterStart.statusCode).toBe(200);
+      expect(resAfterStart.headers["content-type"]).toContain(
+        "text/event-stream",
+      );
+
+      await appStart.close();
       await app.close();
     });
 

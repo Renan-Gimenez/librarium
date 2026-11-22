@@ -65,16 +65,21 @@ describe("useChatSession hook", () => {
     expect(stored?.sessionId).toBe(result.current.sessionId);
   });
 
-  it("updates lastActiveAt when touchSession is called", () => {
+  it("updates lastActiveAt and returns { sessionId, expired: false } synchronously when touchSession is called", () => {
     const { result } = renderHook(() => useChatSession());
     const initialSession = getStoredSession();
     const initialTime = initialSession!.lastActiveAt;
 
+    let touchResult: ReturnType<typeof result.current.touchSession> | undefined;
     act(() => {
       // Simulate small time progression
-      result.current.touchSession();
+      touchResult = result.current.touchSession();
     });
 
+    expect(touchResult).toEqual({
+      sessionId: result.current.sessionId,
+      expired: false,
+    });
     const updatedSession = getStoredSession();
     expect(updatedSession?.sessionId).toBe(result.current.sessionId);
     expect(updatedSession?.lastActiveAt).toBeGreaterThanOrEqual(initialTime);
@@ -102,7 +107,7 @@ describe("useChatSession hook", () => {
     expect(localStorage.getItem(CHAT_SESSION_STORAGE_KEY)).toBeNull();
   });
 
-  it("touchSession generates a new session if expired while tab remained open", () => {
+  it("touchSession generates a new session and returns { sessionId, expired: true } synchronously if expired while tab remained open", () => {
     const { result } = renderHook(() => useChatSession());
     const initialId = result.current.sessionId;
 
@@ -110,10 +115,13 @@ describe("useChatSession hook", () => {
     const expiredTimestamp = Date.now() - (CHAT_SESSION_EXPIRY_MS + 5000);
     saveSession({ sessionId: initialId, lastActiveAt: expiredTimestamp });
 
+    let touchResult: ReturnType<typeof result.current.touchSession> | undefined;
     act(() => {
-      result.current.touchSession();
+      touchResult = result.current.touchSession();
     });
 
+    expect(touchResult?.expired).toBe(true);
+    expect(touchResult?.sessionId).toBe(result.current.sessionId);
     expect(result.current.sessionId).not.toBe(initialId);
     const stored = getStoredSession();
     expect(stored?.sessionId).toBe(result.current.sessionId);

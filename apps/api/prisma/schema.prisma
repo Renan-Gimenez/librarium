@@ -11,18 +11,19 @@ generator client {
 
 datasource db {
   provider   = "postgresql"
-  extensions = [vector]
+  extensions = [vector, unaccent]
 }
 
 model Book {
-  id          String                       @id @default(uuid())
-  title       String
-  author      String
-  description String?
-  coverUrl    String?
-  rating      Float?
-  publishedAt DateTime?
-  embedding   Unsupported("vector(1536)")?
+  id           String                       @id @default(uuid())
+  title        String
+  author       String
+  description  String?
+  coverUrl     String?
+  rating       Float?
+  publishedAt  DateTime?
+  embedding    Unsupported("vector(1536)")?
+  searchVector Unsupported("tsvector")?     @map("search_vector")
 
   genres Genre[]
 

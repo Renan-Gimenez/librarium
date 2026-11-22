@@ -14,7 +14,17 @@ export interface ChatRoutesOptions {
 }
 
 const chatMessageBodySchema = z.object({
-  message: z.string().trim().min(1, "Message cannot be empty."),
+  message: z
+    .string()
+    .trim()
+    .min(1, "Message cannot be empty.")
+    .max(2000, "Message cannot exceed 2000 characters."),
+});
+
+const chatErrorResponseSchema = z.object({
+  statusCode: z.number(),
+  error: z.string(),
+  message: z.string(),
 });
 
 function writeSseEvent(
@@ -184,6 +194,7 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
               }),
             }),
           }),
+          409: chatErrorResponseSchema,
         },
       },
     },
@@ -191,7 +202,7 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
       const token = req.token!;
       const { message } = req.body;
 
-      const result = await handleMessage({ token, message });
+      const result = await handleMessage({ token, message, logger: req.log });
 
       res.status(200);
       return result;
@@ -224,6 +235,7 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
             .describe(
               "Server-Sent Events stream emitting delta, done, and error events.",
             ),
+          409: chatErrorResponseSchema,
         },
       },
     },
@@ -233,16 +245,13 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
 
       const abortController = new AbortController();
       let stopWatchingDisconnect: (() => void) | undefined;
+      let streamStarted = false;
 
-      try {
-        stopWatchingDisconnect = watchResponseDisconnect(
-          res.raw,
-          abortController,
-        );
-        if (abortController.signal.aborted) {
+      const ensureStreamStarted = () => {
+        if (streamStarted) {
           return;
         }
-
+        streamStarted = true;
         res.hijack();
 
         const sseHeaders: Record<string, string | number | string[]> = {};
@@ -260,24 +269,46 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
 
         res.raw.writeHead(200, sseHeaders);
         res.raw.flushHeaders?.();
+      };
+
+      try {
+        stopWatchingDisconnect = watchResponseDisconnect(
+          res.raw,
+          abortController,
+        );
+        if (abortController.signal.aborted) {
+          return;
+        }
 
         const result = await handleStreamMessage({
           token,
           message,
+          logger: req.log,
           signal: abortController.signal,
+          onStreamStart: () => {
+            if (!abortController.signal.aborted) {
+              ensureStreamStarted();
+            }
+          },
           onDelta: (content) => {
             if (abortController.signal.aborted) {
               return;
             }
+            ensureStreamStarted();
             writeSseEvent(res.raw, "delta", { content });
           },
         });
 
         if (!abortController.signal.aborted) {
+          ensureStreamStarted();
           writeSseEvent(res.raw, "done", result);
         }
       } catch (err) {
+        if (!streamStarted && err instanceof AppError && err.statusCode === 409) {
+          throw err;
+        }
         if (!abortController.signal.aborted) {
+          ensureStreamStarted();
           req.log.error(err);
           writeSseEvent(res.raw, "error", {
             message: extractStreamErrorMessage(err),
@@ -285,8 +316,17 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
         }
       } finally {
         stopWatchingDisconnect?.();
-        if (!res.raw.writableEnded) {
+        if (streamStarted && !res.raw.writableEnded) {
           res.raw.end();
+        } else if (
+          !streamStarted &&
+          abortController.signal.aborted &&
+          !res.sent
+        ) {
+          res.hijack();
+          if (!res.raw.writableEnded) {
+            res.raw.end();
+          }
         }
       }
     },

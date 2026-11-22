@@ -172,7 +172,10 @@ export async function streamChatMessage(
   });
 
   if (!response.ok) {
-    let errorMessage = `Erro na requisição (${response.status}).`;
+    let errorMessage =
+      response.status === 409
+        ? "Já existe uma resposta em andamento nesta sessão. Aguarde a conclusão e tente novamente."
+        : `Erro na requisição (${response.status}).`;
     try {
       const rawText = await response.text();
       const trimmed = rawText.trim();

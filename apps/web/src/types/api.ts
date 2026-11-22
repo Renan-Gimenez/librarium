@@ -39,13 +39,39 @@ export interface SingleResponse<T> {
 export type SingleBookResponse = SingleResponse<Book>;
 export type GenresResponse = SingleResponse<Genre[]>;
 
+export interface SimilarBookGenre {
+  slug: string;
+  name: string;
+}
+
+export interface SimilarBook {
+  id: string;
+  title: string;
+  author: string;
+  description: string | null;
+  coverUrl: string | null;
+  genres: SimilarBookGenre[];
+  rating: number | null;
+  publishedAt: string | null;
+  createdAt: string;
+  similarity: number;
+}
+
+export type SimilarBooksResponse = SingleResponse<SimilarBook[]>;
+
 export interface ApiErrorResponse {
   statusCode: number;
   error: string;
   message: string;
 }
 
-export type BookSortBy = "title" | "author" | "rating" | "publishedAt" | "createdAt";
+export type BookSortBy =
+  | "title"
+  | "author"
+  | "rating"
+  | "publishedAt"
+  | "createdAt"
+  | "relevance";
 export type SortOrder = "asc" | "desc";
 
 export interface BooksQueryParams {
@@ -82,6 +108,7 @@ export interface ChatMessage {
   books?: CitedBook[];
   isCancelled?: boolean;
   isStreaming?: boolean;
+  isSystemNotice?: boolean;
 }
 
 export interface ChatStreamDeltaEvent {

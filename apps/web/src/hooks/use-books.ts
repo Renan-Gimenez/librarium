@@ -4,11 +4,12 @@ import {
   type UseQueryOptions,
 } from "@tanstack/react-query";
 
-import { getBookById, getBooks, getGenres } from "@/services/books";
+import { getBookById, getBooks, getGenres, getSimilarBooks } from "@/services/books";
 import type {
   BooksQueryParams,
   GenresResponse,
   PaginatedBooksResponse,
+  SimilarBooksResponse,
   SingleBookResponse,
 } from "@/types/api";
 
@@ -31,6 +32,9 @@ export const bookKeys = {
     ] as const,
   details: () => [...bookKeys.all, "detail"] as const,
   detail: (id: string) => [...bookKeys.details(), id] as const,
+  similars: () => [...bookKeys.all, "similar"] as const,
+  similar: (id: string, limit = 4) =>
+    [...bookKeys.similars(), id, { limit }] as const,
   genres: () => ["genres"] as const,
 };
 
@@ -62,6 +66,25 @@ export function useBook(
     ...options,
     queryKey: bookKeys.detail(normalizedId),
     queryFn: ({ signal }) => getBookById(normalizedId, { signal }),
+    enabled: Boolean(normalizedId) && (options?.enabled ?? true),
+  });
+}
+
+export function useSimilarBooks(
+  id?: string,
+  limit = 4,
+  options?: Omit<
+    UseQueryOptions<SimilarBooksResponse, Error>,
+    "queryKey" | "queryFn"
+  >,
+) {
+  const normalizedId = id?.trim() || "";
+
+  return useQuery({
+    retry: false,
+    ...options,
+    queryKey: bookKeys.similar(normalizedId, limit),
+    queryFn: ({ signal }) => getSimilarBooks(normalizedId, { limit, signal }),
     enabled: Boolean(normalizedId) && (options?.enabled ?? true),
   });
 }

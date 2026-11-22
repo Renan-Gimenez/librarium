@@ -1,4 +1,5 @@
 @baseURL = http://localhost:3333/api
+@adminKey = dev-admin-api-key
 
 ### List all genres
 GET {{baseURL}}/genres
@@ -9,6 +10,7 @@ GET {{baseURL}}/genres/terror
 ### Create a new genre
 POST {{baseURL}}/genres
 Content-Type: application/json
+X-Admin-Key: {{adminKey}}
 
 {
   "slug": "terror",
@@ -18,6 +20,7 @@ Content-Type: application/json
 ### Update genre name
 PUT {{baseURL}}/genres/terror
 Content-Type: application/json
+X-Admin-Key: {{adminKey}}
 
 {
   "name": "Terror e Horror"
@@ -25,4 +28,5 @@ Content-Type: application/json
 
 ### Delete genre by slug
 DELETE {{baseURL}}/genres/terror
+X-Admin-Key: {{adminKey}}
 

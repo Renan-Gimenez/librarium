@@ -1,12 +1,19 @@
+import "@/test-setup";
 import { describe, expect, it, spyOn } from "bun:test";
+import * as React from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { renderHook, waitFor } from "@testing-library/react";
 import type { AxiosResponse, InternalAxiosRequestConfig } from "axios";
 
 import { api } from "@/lib/api";
-import { getBookById, getBooks, getGenres } from "./books";
+import { bookKeys, useSimilarBooks } from "@/hooks/use-books";
+import { getBookById, getBooks, getGenres, getSimilarBooks } from "./books";
 import type {
   Book,
   Genre,
   PaginatedBooksResponse,
+  SimilarBook,
+  SimilarBooksResponse,
   SingleBookResponse,
 } from "@/types/api";
 
@@ -251,6 +258,171 @@ describe("books service", () => {
       const getSpy = spyOn(api, "get").mockRejectedValueOnce(errorResponse);
 
       await expect(getGenres()).rejects.toThrow("Failed to load genres");
+      getSpy.mockRestore();
+    });
+  });
+
+  describe("getSimilarBooks", () => {
+    const mockSimilarBook: SimilarBook = {
+      id: "uuid-456",
+      title: "Dune Messiah",
+      author: "Frank Herbert",
+      description: "Sequel to Dune.",
+      coverUrl: "https://example.com/messiah.jpg",
+      genres: [{ slug: "sci-fi", name: "Science Fiction" }],
+      rating: 4.5,
+      publishedAt: "1969-10-15T00:00:00.000Z",
+      createdAt: "2026-08-23T03:00:00.000Z",
+      similarity: 92,
+    };
+
+    it("should fetch similar books by book id without options", async () => {
+      const mockResponse: SimilarBooksResponse = {
+        data: [mockSimilarBook],
+      };
+
+      const getSpy = spyOn(api, "get").mockResolvedValueOnce(
+        createAxiosResponse(mockResponse),
+      );
+
+      const result = await getSimilarBooks("uuid-123");
+
+      expect(getSpy).toHaveBeenCalledWith("/books/uuid-123/similar", {
+        params: undefined,
+        signal: undefined,
+      });
+      expect(result).toEqual(mockResponse);
+      getSpy.mockRestore();
+    });
+
+    it("should forward limit and AbortSignal options", async () => {
+      const mockResponse: SimilarBooksResponse = {
+        data: [mockSimilarBook],
+      };
+
+      const getSpy = spyOn(api, "get").mockResolvedValueOnce(
+        createAxiosResponse(mockResponse),
+      );
+
+      const controller = new AbortController();
+      await getSimilarBooks("uuid-123", {
+        limit: 4,
+        signal: controller.signal,
+      });
+
+      expect(getSpy).toHaveBeenCalledWith("/books/uuid-123/similar", {
+        params: { limit: 4 },
+        signal: controller.signal,
+      });
+      getSpy.mockRestore();
+    });
+
+    it("should throw an error if id is empty or whitespace", async () => {
+      await expect(getSimilarBooks("   ")).rejects.toThrow(
+        "A valid book ID is required",
+      );
+    });
+
+    it("should encode URI components in book id", async () => {
+      const mockResponse: SimilarBooksResponse = {
+        data: [],
+      };
+
+      const getSpy = spyOn(api, "get").mockResolvedValueOnce(
+        createAxiosResponse(mockResponse),
+      );
+
+      await getSimilarBooks("special/book #1");
+
+      expect(getSpy).toHaveBeenCalledWith(
+        "/books/special%2Fbook%20%231/similar",
+        {
+          params: undefined,
+          signal: undefined,
+        },
+      );
+      getSpy.mockRestore();
+    });
+
+    it("should propagate errors when fetching similar books fails", async () => {
+      const networkError = new Error("Failed to load similar books");
+      const getSpy = spyOn(api, "get").mockRejectedValueOnce(networkError);
+
+      await expect(getSimilarBooks("uuid-123")).rejects.toThrow(
+        "Failed to load similar books",
+      );
+      getSpy.mockRestore();
+    });
+  });
+
+  describe("useSimilarBooks hook and bookKeys", () => {
+    it("should build deterministic query key via bookKeys.similar", () => {
+      expect(bookKeys.similar("book-1")).toEqual([
+        "books",
+        "similar",
+        "book-1",
+        { limit: 4 },
+      ]);
+      expect(bookKeys.similar("book-1", 6)).toEqual([
+        "books",
+        "similar",
+        "book-1",
+        { limit: 6 },
+      ]);
+    });
+
+    it("should fetch similar books for valid id and stay disabled for empty id", async () => {
+      const mockResponse: SimilarBooksResponse = {
+        data: [
+          {
+            id: "uuid-456",
+            title: "Dune Messiah",
+            author: "Frank Herbert",
+            description: "Sequel to Dune.",
+            coverUrl: null,
+            genres: [{ slug: "sci-fi", name: "Science Fiction" }],
+            rating: 4.5,
+            publishedAt: "1969-10-15T00:00:00.000Z",
+            createdAt: "2026-08-23T03:00:00.000Z",
+            similarity: 89,
+          },
+        ],
+      };
+
+      const getSpy = spyOn(api, "get").mockResolvedValue(
+        createAxiosResponse(mockResponse),
+      );
+
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      const wrapper = ({ children }: { children: React.ReactNode }) =>
+        React.createElement(QueryClientProvider, { client }, children);
+
+      const { result: disabledResult } = renderHook(
+        () => useSimilarBooks("   "),
+        { wrapper },
+      );
+      expect(disabledResult.current.fetchStatus).toBe("idle");
+      expect(getSpy).not.toHaveBeenCalled();
+
+      const { result } = renderHook(() => useSimilarBooks("uuid-123", 4), {
+        wrapper,
+      });
+
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+      });
+
+      expect(getSpy).toHaveBeenCalledTimes(1);
+      expect(getSpy).toHaveBeenCalledWith(
+        "/books/uuid-123/similar",
+        expect.objectContaining({
+          params: { limit: 4 },
+        }),
+      );
+      expect(result.current.data).toEqual(mockResponse);
+
       getSpy.mockRestore();
     });
   });
