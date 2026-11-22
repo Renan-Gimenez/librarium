@@ -13,7 +13,13 @@ import { env } from "@/config/env";
 import { errorHandler } from "@/errors";
 
 import { booksRoutes, type BookRoutesOptions } from "./book.routes";
-import { listBooks, type BookWithGenres } from "./book.service";
+import {
+  DEFAULT_MIN_SIMILARITY,
+  findSimilarBooksByBookId,
+  listBooks,
+  type BookWithGenres,
+  type SimilarBook,
+} from "./book.service";
 
 const makeBook = (overrides: Partial<BookWithGenres> = {}): BookWithGenres => ({
   id: "book-1",
@@ -33,6 +39,27 @@ const makeBook = (overrides: Partial<BookWithGenres> = {}): BookWithGenres => ({
       updatedAt: new Date("2026-01-01T00:00:00.000Z"),
     },
   ],
+  ...overrides,
+});
+
+const makeSimilarBook = (
+  overrides: Partial<SimilarBook> = {},
+): SimilarBook => ({
+  id: "book-2",
+  title: "Messias de Duna",
+  author: "Frank Herbert",
+  description: "Continuação direta de Duna.",
+  coverUrl: "https://example.com/messias.jpg",
+  rating: 4.5,
+  publishedAt: new Date("1969-10-15T00:00:00.000Z"),
+  createdAt: new Date("2026-01-02T00:00:00.000Z"),
+  genres: [
+    {
+      slug: "ficcao-cientifica",
+      name: "Ficção Científica",
+    },
+  ],
+  similarity: 0.88,
   ...overrides,
 });
 
@@ -303,6 +330,223 @@ describe("book.routes", () => {
 
       await app.close();
     });
+
+    it("allows GET /api/books/:id/similar without X-Admin-Key, normalizes similarity 1-100, and respects default and explicit limit", async () => {
+      const findSimilarMock = mock(async () => ({
+        status: "ok" as const,
+        sourceBook: {
+          id: "book-1",
+          title: "Duna",
+          author: "Frank Herbert",
+        },
+        books: [
+          makeSimilarBook({ id: "sim-min", similarity: 0.001 }),
+          makeSimilarBook({ id: "sim-mid", similarity: 0.876 }),
+          makeSimilarBook({ id: "sim-threshold", similarity: 0.254 }),
+          makeSimilarBook({ id: "sim-max", similarity: 1.2 }),
+        ],
+      }));
+
+      const app = buildTestApp({
+        findSimilarBooksByBookId: findSimilarMock,
+      });
+
+      const defaultRes = await app.inject({
+        method: "GET",
+        url: "/api/books/book-1/similar",
+      });
+      expect(defaultRes.statusCode).toBe(200);
+      expect(findSimilarMock).toHaveBeenCalledWith(
+        "book-1",
+        4,
+        DEFAULT_MIN_SIMILARITY,
+      );
+
+      const defaultBody = defaultRes.json();
+      expect(defaultBody.data).toHaveLength(4);
+      expect(defaultBody.data.map((b: { similarity: number }) => b.similarity)).toEqual([
+        1,
+        88,
+        25,
+        100,
+      ]);
+
+      const customLimitRes = await app.inject({
+        method: "GET",
+        url: "/api/books/book-1/similar?limit=7",
+      });
+      expect(customLimitRes.statusCode).toBe(200);
+      expect(findSimilarMock).toHaveBeenCalledWith(
+        "book-1",
+        7,
+        DEFAULT_MIN_SIMILARITY,
+      );
+
+      const minLimitRes = await app.inject({
+        method: "GET",
+        url: "/api/books/book-1/similar?limit=1",
+      });
+      expect(minLimitRes.statusCode).toBe(200);
+      expect(findSimilarMock).toHaveBeenCalledWith(
+        "book-1",
+        1,
+        DEFAULT_MIN_SIMILARITY,
+      );
+
+      const maxLimitRes = await app.inject({
+        method: "GET",
+        url: "/api/books/book-1/similar?limit=10",
+      });
+      expect(maxLimitRes.statusCode).toBe(200);
+      expect(findSimilarMock).toHaveBeenCalledWith(
+        "book-1",
+        10,
+        DEFAULT_MIN_SIMILARITY,
+      );
+
+      await app.close();
+    });
+
+    it("returns 404 for not_found and 200 [] for no_embedding or empty matches on GET /api/books/:id/similar", async () => {
+      const findSimilarMock = mock(async (id: string) => {
+        if (id === "missing") {
+          return { status: "not_found" as const };
+        }
+        if (id === "no-embedding") {
+          return {
+            status: "no_embedding" as const,
+            sourceBook: {
+              id: "no-embedding",
+              title: "Sem Embedding",
+              author: "Autor",
+            },
+          };
+        }
+        return {
+          status: "ok" as const,
+          sourceBook: {
+            id,
+            title: "Isolado",
+            author: "Autor",
+          },
+          books: [],
+        };
+      });
+
+      const app = buildTestApp({
+        findSimilarBooksByBookId: findSimilarMock,
+      });
+
+      const notFoundRes = await app.inject({
+        method: "GET",
+        url: "/api/books/missing/similar",
+      });
+      expect(notFoundRes.statusCode).toBe(404);
+      expect(notFoundRes.json()).toEqual({ data: null });
+
+      const noEmbeddingRes = await app.inject({
+        method: "GET",
+        url: "/api/books/no-embedding/similar",
+      });
+      expect(noEmbeddingRes.statusCode).toBe(200);
+      expect(noEmbeddingRes.json()).toEqual({ data: [] });
+
+      const emptyRes = await app.inject({
+        method: "GET",
+        url: "/api/books/isolated/similar",
+      });
+      expect(emptyRes.statusCode).toBe(200);
+      expect(emptyRes.json()).toEqual({ data: [] });
+
+      await app.close();
+    });
+
+    it("returns 400 Bad Request for invalid limit values on GET /api/books/:id/similar", async () => {
+      const findSimilarMock = mock(async () => ({
+        status: "not_found" as const,
+      }));
+      const app = buildTestApp({
+        findSimilarBooksByBookId: findSimilarMock,
+      });
+
+      for (const invalidQuery of ["limit=0", "limit=11", "limit=abc", "limit=2.5"]) {
+        const res = await app.inject({
+          method: "GET",
+          url: `/api/books/book-1/similar?${invalidQuery}`,
+        });
+        expect(res.statusCode).toBe(400);
+      }
+
+      expect(findSimilarMock).not.toHaveBeenCalled();
+
+      await app.close();
+    });
+
+    it("serializes hydrated rows from findSimilarBooksByBookId through SimilarBookSchema", async () => {
+      const app = buildTestApp({
+        findSimilarBooksByBookId: (bookId, limit, minSimilarity) =>
+          findSimilarBooksByBookId(bookId, limit, minSimilarity, {
+            prisma: {
+              $queryRaw: async <T = unknown>(sqlQuery: unknown): Promise<T> => {
+                const rawSql = Array.isArray(sqlQuery)
+                  ? sqlQuery.join("")
+                  : ((sqlQuery as { sql?: string }).sql ?? "");
+                if (rawSql.includes("embeddingText")) {
+                  return [
+                    {
+                      id: "book-1",
+                      title: "Duna",
+                      author: "Frank Herbert",
+                      embeddingText: "[0.1,0.2,0.3]",
+                    },
+                  ] as T;
+                }
+                return [
+                  {
+                    id: "book-2",
+                    title: "Fundação",
+                    author: "Isaac Asimov",
+                    description: "Império Galáctico.",
+                    coverUrl: null,
+                    rating: "4.7",
+                    publishedAt: "1951-05-01T00:00:00.000Z",
+                    createdAt: "2026-01-01T00:00:00.000Z",
+                    genres: JSON.stringify([
+                      { slug: "ficcao-cientifica", name: "Ficção Científica" },
+                    ]),
+                    similarity: 0.844,
+                  },
+                ] as T;
+              },
+            },
+          }),
+      });
+
+      const res = await app.inject({
+        method: "GET",
+        url: "/api/books/book-1/similar",
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({
+        data: [
+          {
+            id: "book-2",
+            title: "Fundação",
+            author: "Isaac Asimov",
+            description: "Império Galáctico.",
+            coverUrl: null,
+            rating: 4.7,
+            publishedAt: "1951-05-01T00:00:00.000Z",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            genres: [{ slug: "ficcao-cientifica", name: "Ficção Científica" }],
+            similarity: 84,
+          },
+        ],
+      });
+
+      await app.close();
+    });
   });
 
   describe("admin-protected mutation routes", () => {
@@ -543,6 +787,24 @@ describe("book.routes", () => {
       expect(queryParamNames).toContain("publishedAfter");
       expect(queryParamNames).toContain("publishedBefore");
       expect(spec.paths?.["/api/books/{id}"]?.get?.security).toBeUndefined();
+      expect(
+        spec.paths?.["/api/books/{id}/similar"]?.get?.security,
+      ).toBeUndefined();
+      expect(
+        spec.paths?.["/api/books/{id}/similar"]?.get?.responses?.["200"],
+      ).toBeDefined();
+      expect(
+        spec.paths?.["/api/books/{id}/similar"]?.get?.responses?.["404"],
+      ).toBeDefined();
+      expect(
+        spec.paths?.["/api/books/{id}/similar"]?.get?.responses?.["401"],
+      ).toBeUndefined();
+      const similarLimitParam = spec.paths?.[
+        "/api/books/{id}/similar"
+      ]?.get?.parameters?.find(
+        (param) => param.name === "limit" && param.in === "query",
+      );
+      expect(similarLimitParam).toBeDefined();
 
       expect(spec.paths?.["/api/books"]?.post?.security).toEqual([
         { adminApiKey: [] },

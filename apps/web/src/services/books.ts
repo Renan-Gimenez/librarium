@@ -3,11 +3,16 @@ import type {
   BooksQueryParams,
   GenresResponse,
   PaginatedBooksResponse,
+  SimilarBooksResponse,
   SingleBookResponse,
 } from "@/types/api";
 
 export interface RequestOptions {
   signal?: AbortSignal;
+}
+
+export interface GetSimilarBooksOptions extends RequestOptions {
+  limit?: number;
 }
 
 export async function getBooks(
@@ -56,6 +61,29 @@ export async function getBookById(
       signal: options?.signal,
     },
   );
+  return response.data;
+}
+
+export async function getSimilarBooks(
+  id: string,
+  options?: GetSimilarBooksOptions,
+): Promise<SimilarBooksResponse> {
+  const trimmed = id?.trim();
+  if (!trimmed) {
+    throw new Error("A valid book ID is required");
+  }
+
+  const hasValidLimit =
+    typeof options?.limit === "number" && Number.isFinite(options.limit);
+
+  const response = await api.get<SimilarBooksResponse>(
+    `/books/${encodeURIComponent(trimmed)}/similar`,
+    {
+      params: hasValidLimit ? { limit: options!.limit } : undefined,
+      signal: options?.signal,
+    },
+  );
+
   return response.data;
 }
 

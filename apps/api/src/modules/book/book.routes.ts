@@ -8,7 +8,9 @@ import { GenreSchema } from "@/modules/genre/genre.routes";
 import {
   bookInputSchema,
   createBook,
+  DEFAULT_MIN_SIMILARITY,
   deleteBook,
+  findSimilarBooksByBookId,
   listBooks,
   listBooksQuerySchema,
   reindexBooks,
@@ -20,6 +22,7 @@ import {
 export interface BookRoutesOptions {
   listBooks?: typeof listBooks;
   findBookById?: (id: string) => Promise<BookWithGenres | null>;
+  findSimilarBooksByBookId?: typeof findSimilarBooksByBookId;
   createBook?: typeof createBook;
   updateBook?: typeof updateBook;
   deleteBook?: typeof deleteBook;
@@ -50,6 +53,28 @@ export const BookSchema = z.object({
   updatedAt: z.date(),
 });
 
+export const SimilarBookGenreSchema = z.object({
+  slug: z.string(),
+  name: z.string(),
+});
+
+export const SimilarBookSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  author: z.string(),
+  description: z.string().nullable(),
+  coverUrl: z.string().nullable(),
+  genres: z.array(SimilarBookGenreSchema),
+  rating: z.number().nullable(),
+  publishedAt: z.date().nullable(),
+  createdAt: z.date(),
+  similarity: z.number().int().min(1).max(100),
+});
+
+export const similarBooksQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(10).default(4),
+});
+
 export const booksRoutes: FastifyPluginAsyncZod<BookRoutesOptions> = async (
   app,
   opts,
@@ -62,6 +87,8 @@ export const booksRoutes: FastifyPluginAsyncZod<BookRoutesOptions> = async (
         where: { id },
         include: { genres: true },
       }));
+  const handleFindSimilarBooksByBookId =
+    opts.findSimilarBooksByBookId ?? findSimilarBooksByBookId;
   const handleCreateBook = opts.createBook ?? createBook;
   const handleUpdateBook = opts.updateBook ?? updateBook;
   const handleDeleteBook = opts.deleteBook ?? deleteBook;
@@ -117,6 +144,64 @@ export const booksRoutes: FastifyPluginAsyncZod<BookRoutesOptions> = async (
       }
 
       return { data: book };
+    },
+  );
+
+  app.get(
+    "/:id/similar",
+    {
+      schema: {
+        tags: ["Books"],
+        summary: "Find similar books for a given book",
+        params: z.object({
+          id: z.string(),
+        }),
+        querystring: similarBooksQuerySchema,
+        response: {
+          200: z.object({
+            data: z.array(SimilarBookSchema),
+          }),
+          404: z.object({
+            data: z.null(),
+          }),
+        },
+      },
+    },
+    async (req, res) => {
+      const { id } = req.params;
+      const { limit } = req.query;
+
+      const result = await handleFindSimilarBooksByBookId(
+        id,
+        limit,
+        DEFAULT_MIN_SIMILARITY,
+      );
+
+      if (result.status === "not_found") {
+        res.status(404);
+        return { data: null };
+      }
+
+      if (result.status === "no_embedding") {
+        return { data: [] };
+      }
+
+      return {
+        data: result.books.map((book) => ({
+          id: book.id,
+          title: book.title,
+          author: book.author,
+          description: book.description,
+          coverUrl: book.coverUrl,
+          genres: book.genres,
+          rating: book.rating,
+          publishedAt: book.publishedAt,
+          createdAt: book.createdAt,
+          similarity: Number.isFinite(book.similarity)
+            ? Math.max(1, Math.min(100, Math.round(book.similarity * 100)))
+            : 1,
+        })),
+      };
     },
   );
 

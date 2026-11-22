@@ -163,6 +163,7 @@ export function App() {
           book={selectedBook}
           isOpen={Boolean(selectedBook)}
           onClose={() => setSelectedBook(null)}
+          onSelectBook={handleSelectBook}
           onAskAI={(book) => {
             setSelectedBook(null);
             setChatInitialPrompt(

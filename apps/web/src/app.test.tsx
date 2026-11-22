@@ -1,12 +1,12 @@
 import "./test-setup";
-import { beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as React from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./app";
 import type { AxiosResponse, InternalAxiosRequestConfig } from "axios";
 import { api } from "./lib/api";
-import type { Book, Genre, PaginatedBooksResponse } from "./types/api";
+import type { Book, Genre, PaginatedBooksResponse, SimilarBook } from "./types/api";
 
 const mockGenresList: Genre[] = [
   {
@@ -89,6 +89,7 @@ function renderWithClient(ui: React.ReactElement) {
 
 describe("App component integration", () => {
   let mockBooksResponse: PaginatedBooksResponse;
+  let apiGetSpy: ReturnType<typeof spyOn<typeof api, "get">> | undefined;
 
   beforeEach(() => {
     mockBooksResponse = {
@@ -101,15 +102,22 @@ describe("App component integration", () => {
       },
     };
 
-    spyOn(api, "get").mockImplementation(((url: string) => {
+    apiGetSpy = spyOn(api, "get").mockImplementation(((url: string) => {
       if (url.includes("/genres")) {
         return Promise.resolve(createAxiosResponse({ data: mockGenresList }));
+      }
+      if (url.includes("/similar")) {
+        return Promise.resolve(createAxiosResponse({ data: [] }));
       }
       if (url.includes("/books")) {
         return Promise.resolve(createAxiosResponse(mockBooksResponse));
       }
       return Promise.reject(new Error(`Unhandled URL: ${url}`));
     }) as unknown as typeof api.get);
+  });
+
+  afterEach(() => {
+    apiGetSpy?.mockRestore();
   });
 
   it("renders header, filter bar and catalogue grid with books", async () => {
@@ -340,9 +348,12 @@ describe("App component integration", () => {
   it("clamps page when totalPages returned by server is less than current page", async () => {
     let currentTotalPages = 3;
 
-    spyOn(api, "get").mockImplementation(((url: string, config?: { params?: Record<string, unknown> }) => {
+    apiGetSpy?.mockImplementation(((url: string, config?: { params?: Record<string, unknown> }) => {
       if (url.includes("/genres")) {
         return Promise.resolve(createAxiosResponse({ data: mockGenresList }));
+      }
+      if (url.includes("/similar")) {
+        return Promise.resolve(createAxiosResponse({ data: [] }));
       }
       if (url.includes("/books")) {
         const requestedPage = (config?.params?.page as number) || 1;
@@ -468,12 +479,15 @@ describe("App component integration", () => {
   it("omits sortBy during search so backend ranks by relevance, and sends sortBy when user explicitly chooses a sort option", async () => {
     const bookRequests: Array<Record<string, unknown> | undefined> = [];
 
-    spyOn(api, "get").mockImplementation(((
+    apiGetSpy?.mockImplementation(((
       url: string,
       config?: { params?: Record<string, unknown> },
     ) => {
       if (url.includes("/genres")) {
         return Promise.resolve(createAxiosResponse({ data: mockGenresList }));
+      }
+      if (url.includes("/similar")) {
+        return Promise.resolve(createAxiosResponse({ data: [] }));
       }
       if (url.includes("/books")) {
         bookRequests.push(config?.params);
@@ -513,5 +527,71 @@ describe("App component integration", () => {
       expect(explicitSortCall).toBeDefined();
       expect(explicitSortCall?.order).toBe("desc");
     });
+  });
+
+  it("navigates to a similar book inside BookDetailsModal without scrolling the catalog page", async () => {
+    const windowScrollSpy = spyOn(window, "scrollTo").mockImplementation(() => {});
+    const similarDuneMessiah: SimilarBook = {
+      id: "3",
+      title: "Messias de Duna",
+      author: "Frank Herbert",
+      description: "Doze anos após os eventos de Duna.",
+      coverUrl: "https://example.com/messias.jpg",
+      genres: [{ slug: "sci-fi", name: "Ficção Científica" }],
+      rating: 4.5,
+      publishedAt: "1969-10-15T00:00:00.000Z",
+      createdAt: "2026-08-24T03:00:00.000Z",
+      similarity: 95,
+    };
+
+    apiGetSpy?.mockImplementation(((url: string) => {
+      if (url.includes("/genres")) {
+        return Promise.resolve(createAxiosResponse({ data: mockGenresList }));
+      }
+      if (url.includes("/books/1/similar")) {
+        return Promise.resolve(
+          createAxiosResponse({ data: [similarDuneMessiah] }),
+        );
+      }
+      if (url.includes("/similar")) {
+        return Promise.resolve(createAxiosResponse({ data: [] }));
+      }
+      if (url.includes("/books")) {
+        return Promise.resolve(createAxiosResponse(mockBooksResponse));
+      }
+      return Promise.reject(new Error(`Unhandled URL: ${url}`));
+    }) as unknown as typeof api.get);
+
+    renderWithClient(<App />);
+
+    const dunaCard = await screen.findByRole("button", {
+      name: "Livro: Duna, por Frank Herbert",
+    });
+    fireEvent.click(dunaCard);
+
+    expect(
+      await screen.findByRole("heading", { name: "Livros parecidos" }),
+    ).toBeDefined();
+
+    const similarCard = await screen.findByRole("button", {
+      name: "Ver detalhes do livro Messias de Duna, por Frank Herbert",
+    });
+
+    const detailsPanel = screen.getByTestId("book-details-panel");
+    const panelScrollSpy = mock(() => {});
+    detailsPanel.scrollTo = panelScrollSpy as unknown as typeof detailsPanel.scrollTo;
+
+    fireEvent.click(similarCard);
+
+    expect(
+      await screen.findByRole("heading", { name: "Messias de Duna" }),
+    ).toBeDefined();
+    expect(
+      screen.getByText("Doze anos após os eventos de Duna."),
+    ).toBeDefined();
+    expect(panelScrollSpy).toHaveBeenCalledWith({ top: 0, behavior: "smooth" });
+    expect(windowScrollSpy).not.toHaveBeenCalled();
+
+    windowScrollSpy.mockRestore();
   });
 });
