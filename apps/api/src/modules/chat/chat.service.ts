@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   ChatCompletion,
   ChatCompletionChunk,
@@ -8,6 +9,7 @@ import type {
 } from "openai/resources/chat/completions";
 
 import { env } from "@/config/env";
+import { ConflictError } from "@/errors";
 import { openai, prisma, redis } from "@/lib";
 
 import { buildSystemPrompt, type PromptGenre } from "./chat.prompts";
@@ -21,6 +23,13 @@ import {
 } from "./chat.tools";
 
 export const MAX_TOOL_ROUNDS = 4;
+export const CHAT_LOCK_TTL_SECONDS = 60;
+export const RELEASE_LOCK_LUA_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+
+export function hashSessionToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 32);
+}
 
 export const FALLBACK_EMPTY_REPLY =
   "Desculpe, não consegui concluir a busca no acervo neste momento. Tente reformular sua pergunta sobre livros, autores ou gêneros.";
@@ -50,13 +59,21 @@ export interface ChatResponseUsage {
   totalTokens: number;
 }
 
+export interface ChatLogger {
+  info: (obj: Record<string, unknown>, msg?: string) => void;
+  warn?: (obj: Record<string, unknown>, msg?: string) => void;
+  error?: (obj: Record<string, unknown>, msg?: string) => void;
+}
+
 export interface ProcessChatMessageInput {
   token: string;
   message: string;
+  logger?: ChatLogger;
 }
 
 export interface StreamChatMessageInput extends ProcessChatMessageInput {
   signal?: AbortSignal;
+  onStreamStart?: () => void;
   onDelta?: (content: string) => void;
 }
 
@@ -82,16 +99,40 @@ export interface ChatServiceBaseDeps {
   };
   redis?: {
     get: (key: string) => Promise<string | null>;
-    set: (
-      key: string,
-      value: string,
-      expiryMode: "EX",
-      seconds: number,
+    set: {
+      (
+        key: string,
+        value: string,
+        expiryMode: "EX",
+        seconds: number,
+      ): Promise<unknown>;
+      (
+        key: string,
+        value: string,
+        expiryMode: "EX",
+        seconds: number,
+        condition: "NX",
+      ): Promise<unknown>;
+    };
+    lrange?: (key: string, start: number, stop: number) => Promise<string[]>;
+    eval?: (
+      script: string,
+      numkeys: number,
+      ...args: (string | number)[]
     ) => Promise<unknown>;
+    multi?: () => {
+      del: (key: string) => unknown;
+      rpush: (key: string, ...values: string[]) => unknown;
+      ltrim: (key: string, start: number, stop: number) => unknown;
+      expire: (key: string, seconds: number) => unknown;
+      exec: () => Promise<unknown>;
+    };
   };
   executeToolCall?: typeof executeChatToolCall;
   toolDeps?: ChatToolsDeps;
+  logger?: ChatLogger;
   sessionTtl?: number;
+  historyWindow?: number;
   now?: () => Date;
   generateId?: () => string;
 }
@@ -158,6 +199,16 @@ export function isBookCitedInReply(title: string, reply: string): boolean {
   return pattern.test(normalizedReply);
 }
 
+function isValidStoredMessage(m: unknown): m is StoredChatMessage {
+  return (
+    typeof m === "object" &&
+    m !== null &&
+    ((m as StoredChatMessage).role === "user" ||
+      (m as StoredChatMessage).role === "assistant") &&
+    typeof (m as StoredChatMessage).content === "string"
+  );
+}
+
 function parseStoredHistory(rawHistory: string | null): StoredChatMessage[] {
   if (!rawHistory) {
     return [];
@@ -169,15 +220,60 @@ function parseStoredHistory(rawHistory: string | null): StoredChatMessage[] {
       return [];
     }
 
-    return parsed.filter(
-      (m): m is StoredChatMessage =>
-        typeof m === "object" &&
-        m !== null &&
-        (m.role === "user" || m.role === "assistant") &&
-        typeof m.content === "string",
-    );
+    return parsed.filter(isValidStoredMessage);
   } catch {
     return [];
+  }
+}
+
+function parseStoredListHistory(items: string[]): StoredChatMessage[] {
+  const result: StoredChatMessage[] = [];
+  for (const raw of items) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (isValidStoredMessage(parsed)) {
+        result.push(parsed);
+      }
+    } catch {
+      // Ignore malformed list entry
+    }
+  }
+  return result;
+}
+
+function isWrongTypeError(err: unknown): boolean {
+  return err instanceof Error && err.message.toUpperCase().includes("WRONGTYPE");
+}
+
+function stripLeadingAssistantMessages(
+  history: StoredChatMessage[],
+): StoredChatMessage[] {
+  const firstUserIndex = history.findIndex((m) => m.role === "user");
+  if (firstUserIndex === -1) {
+    return [];
+  }
+  return firstUserIndex === 0 ? history : history.slice(firstUserIndex);
+}
+
+function isAbortLikeError(err: unknown, signal?: AbortSignal): boolean {
+  return (
+    Boolean(signal?.aborted) ||
+    (err instanceof Error &&
+      (err.name === "AbortError" || err.name === "APIUserAbortError"))
+  );
+}
+
+async function releaseSessionLock(
+  redisClient: NonNullable<ChatServiceBaseDeps["redis"]>,
+  lockKey: string,
+  lockOwner: string,
+): Promise<void> {
+  try {
+    if (typeof redisClient.eval === "function") {
+      await redisClient.eval(RELEASE_LOCK_LUA_SCRIPT, 1, lockKey, lockOwner);
+    }
+  } catch {
+    // Best-effort lock release; TTL acts as fallback
   }
 }
 
@@ -293,14 +389,59 @@ async function raceWithSignal<T>(
 
 interface PreparedChatContext {
   normalizedToken: string;
+  sessionHash: string;
   redisKey: string;
+  lockKey: string;
+  lockOwner: string;
   redisClient: NonNullable<ChatServiceBaseDeps["redis"]>;
   runToolCall: typeof executeChatToolCall;
   sessionTtl: number;
+  historyWindow: number;
+  migratedFromLegacyString: boolean;
   now: () => Date;
   generateId: () => string;
   messageHistory: StoredChatMessage[];
   messages: ChatCompletionMessageParam[];
+}
+
+async function loadChatHistory(
+  redisClient: NonNullable<ChatServiceBaseDeps["redis"]>,
+  redisKey: string,
+  historyWindow: number,
+): Promise<{
+  messageHistory: StoredChatMessage[];
+  migratedFromLegacyString: boolean;
+}> {
+  if (typeof redisClient.lrange === "function") {
+    try {
+      const items = await redisClient.lrange(redisKey, -historyWindow, -1);
+      return {
+        messageHistory: stripLeadingAssistantMessages(
+          parseStoredListHistory(items),
+        ),
+        migratedFromLegacyString: false,
+      };
+    } catch (err) {
+      if (!isWrongTypeError(err)) {
+        throw err;
+      }
+      const legacyRaw = await redisClient.get(redisKey);
+      return {
+        messageHistory: stripLeadingAssistantMessages(
+          parseStoredHistory(legacyRaw).slice(-historyWindow),
+        ),
+        migratedFromLegacyString: true,
+      };
+    }
+  }
+
+  const legacyRaw = await redisClient.get(redisKey);
+  return {
+    messageHistory: stripLeadingAssistantMessages(
+      parseStoredHistory(legacyRaw).slice(-historyWindow),
+    ),
+    migratedFromLegacyString: legacyRaw !== null,
+  };
 }
 
 async function prepareChatContext(
@@ -321,52 +462,83 @@ async function prepareChatContext(
     deps?.redis ?? redis;
   const runToolCall = deps?.executeToolCall ?? executeChatToolCall;
   const sessionTtl = deps?.sessionTtl ?? env.CHAT_SESSION_TTL;
+  const historyWindow = deps?.historyWindow ?? env.CHAT_HISTORY_WINDOW;
   const now = deps?.now ?? (() => new Date());
   const generateId = deps?.generateId ?? (() => crypto.randomUUID());
 
+  const sessionHash = hashSessionToken(normalizedToken);
   const redisKey = `chat:session:${normalizedToken}:messages`;
-
-  const [cachedHistory, genres] = await raceWithSignal(
-    Promise.all([
-      redisClient.get(redisKey),
-      db.genre.findMany({
-        select: { slug: true, name: true },
-        orderBy: { name: "asc" },
-      }),
-    ]),
-    signal,
-  );
+  const lockKey = `chat:session:${normalizedToken}:lock`;
+  const lockOwner = crypto.randomUUID();
 
   throwIfAborted(signal);
 
-  const messageHistory = parseStoredHistory(cachedHistory);
+  const lockAcquired = await redisClient.set(
+    lockKey,
+    lockOwner,
+    "EX",
+    CHAT_LOCK_TTL_SECONDS,
+    "NX",
+  );
 
-  const messages: ChatCompletionMessageParam[] = [
-    {
-      role: "system",
-      content: buildSystemPrompt(genres),
-    },
-    ...messageHistory.map((msg) => ({
-      role: msg.role,
-      content: msg.content,
-    })),
-    {
-      role: "user",
-      content: message,
-    },
-  ];
+  if (lockAcquired !== "OK") {
+    throw new ConflictError(
+      "A chat request is already in progress for this session.",
+    );
+  }
 
-  return {
-    normalizedToken,
-    redisKey,
-    redisClient,
-    runToolCall,
-    sessionTtl,
-    now,
-    generateId,
-    messageHistory,
-    messages,
-  };
+  try {
+    throwIfAborted(signal);
+
+    const [{ messageHistory, migratedFromLegacyString }, genres] =
+      await raceWithSignal(
+        Promise.all([
+          loadChatHistory(redisClient, redisKey, historyWindow),
+          db.genre.findMany({
+            select: { slug: true, name: true },
+            orderBy: { name: "asc" },
+          }),
+        ]),
+        signal,
+      );
+
+    throwIfAborted(signal);
+
+    const messages: ChatCompletionMessageParam[] = [
+      {
+        role: "system",
+        content: buildSystemPrompt(genres),
+      },
+      ...messageHistory.map((msg) => ({
+        role: msg.role,
+        content: msg.content,
+      })),
+      {
+        role: "user",
+        content: message,
+      },
+    ];
+
+    return {
+      normalizedToken,
+      sessionHash,
+      redisKey,
+      lockKey,
+      lockOwner,
+      redisClient,
+      runToolCall,
+      sessionTtl,
+      historyWindow,
+      migratedFromLegacyString,
+      now,
+      generateId,
+      messageHistory,
+      messages,
+    };
+  } catch (err) {
+    await releaseSessionLock(redisClient, lockKey, lockOwner);
+    throw err;
+  }
 }
 
 async function executeAndAppendToolRound(params: {
@@ -459,22 +631,55 @@ async function finalizeChatResult(params: {
     createdAt: context.now().toISOString(),
   };
 
-  const updatedHistory: StoredChatMessage[] = [
-    ...context.messageHistory,
-    userMessage,
-    assistantMessage,
-  ];
-
   if (context.sessionTtl > 0) {
-    await raceWithSignal(
-      context.redisClient.set(
-        context.redisKey,
-        JSON.stringify(updatedHistory),
-        "EX",
-        context.sessionTtl,
-      ),
-      signal,
-    );
+    if (typeof context.redisClient.multi === "function") {
+      const entriesToPush = context.migratedFromLegacyString
+        ? [...context.messageHistory, userMessage, assistantMessage].slice(
+            -context.historyWindow,
+          )
+        : [userMessage, assistantMessage];
+      const serializedEntries = entriesToPush.map((m) => JSON.stringify(m));
+
+      const tx = context.redisClient.multi();
+      if (context.migratedFromLegacyString) {
+        tx.del(context.redisKey);
+      }
+      tx.rpush(context.redisKey, ...serializedEntries);
+      tx.ltrim(context.redisKey, -context.historyWindow, -1);
+      tx.expire(context.redisKey, context.sessionTtl);
+
+      const execResult = await raceWithSignal(tx.exec(), signal);
+      if (
+        !Array.isArray(execResult) ||
+        execResult.some(
+          (entry) =>
+            Array.isArray(entry) && entry[0] !== null && entry[0] !== undefined,
+        )
+      ) {
+        const firstErr = Array.isArray(execResult)
+          ? execResult.find((entry) => Array.isArray(entry) && entry[0])?.[0]
+          : undefined;
+        throw firstErr instanceof Error
+          ? firstErr
+          : new Error("Failed to persist chat history in Redis.");
+      }
+    } else {
+      const updatedHistory: StoredChatMessage[] = [
+        ...context.messageHistory,
+        userMessage,
+        assistantMessage,
+      ].slice(-context.historyWindow);
+
+      await raceWithSignal(
+        context.redisClient.set(
+          context.redisKey,
+          JSON.stringify(updatedHistory),
+          "EX",
+          context.sessionTtl,
+        ),
+        signal,
+      );
+    }
     throwIfAborted(signal);
   }
 
@@ -624,11 +829,80 @@ async function consumeCompletionStream(
   return { content, toolCalls };
 }
 
+function extractToolNames(toolCalls: ChatCompletionMessageToolCall[]): string[] {
+  return toolCalls.map((tc) =>
+    tc.type === "custom" ? tc.custom.name : tc.function.name,
+  );
+}
+
+type ChatTurnOutcomeEvent =
+  | "chat.turn.completed"
+  | "chat.turn.aborted"
+  | "chat.turn.rejected"
+  | "chat.turn.failed";
+
+function emitTurnLog(params: {
+  logger?: ChatLogger;
+  event: ChatTurnOutcomeEvent;
+  mode: "sync" | "stream";
+  sessionHash: string;
+  toolsCalled: string[];
+  toolRounds: number;
+  totalUsage: ChatResponseUsage;
+  startedAtMs: number;
+  citedBooksCount: number;
+}): void {
+  const {
+    logger,
+    event,
+    mode,
+    sessionHash,
+    toolsCalled,
+    toolRounds,
+    totalUsage,
+    startedAtMs,
+    citedBooksCount,
+  } = params;
+
+  if (!logger) {
+    return;
+  }
+
+  const payload: Record<string, unknown> = {
+    event,
+    mode,
+    sessionHash,
+    toolsCalled,
+    toolRounds,
+    promptTokens: totalUsage.promptTokens,
+    completionTokens: totalUsage.completionTokens,
+    totalTokens: totalUsage.totalTokens,
+    durationMs: Math.max(0, Math.round(performance.now() - startedAtMs)),
+    citedBooksCount,
+  };
+
+  if (event === "chat.turn.failed" && logger.error) {
+    logger.error(payload, event);
+    return;
+  }
+
+  if (
+    (event === "chat.turn.aborted" || event === "chat.turn.rejected") &&
+    logger.warn
+  ) {
+    logger.warn(payload, event);
+    return;
+  }
+
+  logger.info(payload, event);
+}
+
 export async function processChatMessage(
   input: ProcessChatMessageInput,
   deps?: ChatServiceDeps,
 ): Promise<ProcessChatMessageResult> {
-  const context = await prepareChatContext(input, deps);
+  const startedAtMs = performance.now();
+  const logger = input.logger ?? deps?.logger;
   const openaiClient: NonNullable<ChatServiceDeps["openai"]> =
     deps?.openai ?? openai;
 
@@ -639,57 +913,106 @@ export async function processChatMessage(
   };
 
   const candidateBooks = new Map<string, ToolBookCandidate>();
+  const toolsCalled: string[] = [];
+  let toolRounds = 0;
   let modelReply = "";
   let hasFinalReply = false;
+  let context: PreparedChatContext | undefined;
+  let outcomeEvent: ChatTurnOutcomeEvent = "chat.turn.completed";
+  let citedBooksCount = 0;
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const response = await openaiClient.chat.completions.create({
-      ...COMPLETION_BASE_PARAMS,
-      user: context.normalizedToken,
-      messages: context.messages,
-      tools: CHAT_TOOLS,
-      tool_choice: "auto",
-    });
+  try {
+    context = await prepareChatContext(input, deps);
 
-    accumulateUsage(totalUsage, response.usage);
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const response = await openaiClient.chat.completions.create({
+        ...COMPLETION_BASE_PARAMS,
+        user: context.sessionHash,
+        messages: context.messages,
+        tools: CHAT_TOOLS,
+        tool_choice: "auto",
+      });
 
-    const assistantMessage = response.choices[0]?.message;
-    const toolCalls = assistantMessage?.tool_calls;
+      accumulateUsage(totalUsage, response.usage);
 
-    if (!toolCalls || toolCalls.length === 0) {
-      modelReply = assistantMessage?.content ?? "";
-      hasFinalReply = true;
-      break;
+      const assistantMessage = response.choices[0]?.message;
+      const toolCalls = assistantMessage?.tool_calls;
+
+      if (!toolCalls || toolCalls.length === 0) {
+        modelReply = assistantMessage?.content ?? "";
+        hasFinalReply = true;
+        break;
+      }
+
+      toolRounds += 1;
+      toolsCalled.push(...extractToolNames(toolCalls));
+
+      await executeAndAppendToolRound({
+        toolCalls,
+        assistantContent: assistantMessage.content ?? null,
+        messages: context.messages,
+        candidateBooks,
+        runToolCall: context.runToolCall,
+        toolDeps: deps?.toolDeps,
+      });
     }
 
-    await executeAndAppendToolRound({
-      toolCalls,
-      assistantContent: assistantMessage.content ?? null,
-      messages: context.messages,
+    if (!hasFinalReply) {
+      const finalResponse = await openaiClient.chat.completions.create({
+        ...COMPLETION_BASE_PARAMS,
+        user: context.sessionHash,
+        messages: context.messages,
+      });
+
+      accumulateUsage(totalUsage, finalResponse.usage);
+      modelReply = finalResponse.choices[0]?.message.content ?? "";
+    }
+
+    const result = await finalizeChatResult({
+      context,
+      userInputMessage: input.message,
+      rawModelReply: modelReply,
       candidateBooks,
-      runToolCall: context.runToolCall,
-      toolDeps: deps?.toolDeps,
+      totalUsage,
     });
+    citedBooksCount = result.data.books.length;
+    return result;
+  } catch (err) {
+    if (isAbortLikeError(err)) {
+      outcomeEvent = "chat.turn.aborted";
+    } else if (err instanceof ConflictError) {
+      outcomeEvent = "chat.turn.rejected";
+    } else {
+      outcomeEvent = "chat.turn.failed";
+    }
+    throw err;
+  } finally {
+    if (context) {
+      await releaseSessionLock(
+        context.redisClient,
+        context.lockKey,
+        context.lockOwner,
+      );
+    }
+    try {
+      const normalizedToken = input.token.trim();
+      emitTurnLog({
+        logger,
+        event: outcomeEvent,
+        mode: "sync",
+        sessionHash:
+          context?.sessionHash ??
+          (normalizedToken ? hashSessionToken(normalizedToken) : "invalid"),
+        toolsCalled,
+        toolRounds,
+        totalUsage,
+        startedAtMs,
+        citedBooksCount,
+      });
+    } catch {
+      // Never allow logger errors to mask the turn outcome
+    }
   }
-
-  if (!hasFinalReply) {
-    const finalResponse = await openaiClient.chat.completions.create({
-      ...COMPLETION_BASE_PARAMS,
-      user: context.normalizedToken,
-      messages: context.messages,
-    });
-
-    accumulateUsage(totalUsage, finalResponse.usage);
-    modelReply = finalResponse.choices[0]?.message.content ?? "";
-  }
-
-  return finalizeChatResult({
-    context,
-    userInputMessage: input.message,
-    rawModelReply: modelReply,
-    candidateBooks,
-    totalUsage,
-  });
 }
 
 /**
@@ -700,8 +1023,9 @@ export async function streamChatMessage(
   input: StreamChatMessageInput,
   deps?: ChatStreamServiceDeps,
 ): Promise<ProcessChatMessageResult> {
-  const { signal, onDelta } = input;
-  const context = await prepareChatContext(input, deps, signal);
+  const startedAtMs = performance.now();
+  const logger = input.logger ?? deps?.logger;
+  const { signal, onDelta, onStreamStart } = input;
   const openaiClient: NonNullable<ChatStreamServiceDeps["openai"]> =
     deps?.openai ?? openai;
 
@@ -712,6 +1036,8 @@ export async function streamChatMessage(
   };
 
   const candidateBooks = new Map<string, ToolBookCandidate>();
+  const toolsCalled: string[] = [];
+  let toolRounds = 0;
   let modelReply = "";
   let streamedPrefix = "";
   let hasFinalReply = false;
@@ -719,6 +1045,9 @@ export async function streamChatMessage(
   let pendingLeadingWhitespace = "";
   let needsSeparatorBeforeNextVisible = false;
   const requestOptions = signal ? { signal } : undefined;
+  let context: PreparedChatContext | undefined;
+  let outcomeEvent: ChatTurnOutcomeEvent = "chat.turn.completed";
+  let citedBooksCount = 0;
 
   const forwardDelta = (delta: string) => {
     if (!hasEmittedVisibleContent) {
@@ -746,90 +1075,135 @@ export async function streamChatMessage(
     onDelta?.(delta);
   };
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    throwIfAborted(signal);
+  try {
+    context = await prepareChatContext(input, deps, signal);
+    onStreamStart?.();
 
-    const stream = await raceWithSignal(
-      openaiClient.chat.completions.create(
-        {
-          ...COMPLETION_BASE_PARAMS,
-          user: context.normalizedToken,
-          messages: context.messages,
-          tools: CHAT_TOOLS,
-          tool_choice: "auto",
-          stream: true,
-          stream_options: { include_usage: true },
-        },
-        requestOptions,
-      ),
-      signal,
-    );
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      throwIfAborted(signal);
 
-    const outcome = await consumeCompletionStream(
-      stream,
-      totalUsage,
-      signal,
-      forwardDelta,
-    );
+      const stream = await raceWithSignal(
+        openaiClient.chat.completions.create(
+          {
+            ...COMPLETION_BASE_PARAMS,
+            user: context.sessionHash,
+            messages: context.messages,
+            tools: CHAT_TOOLS,
+            tool_choice: "auto",
+            stream: true,
+            stream_options: { include_usage: true },
+          },
+          requestOptions,
+        ),
+        signal,
+      );
 
-    if (outcome.toolCalls.length === 0) {
-      modelReply = outcome.content;
-      hasFinalReply = true;
-      break;
-    }
+      const outcome = await consumeCompletionStream(
+        stream,
+        totalUsage,
+        signal,
+        forwardDelta,
+      );
 
-    if (outcome.content.length > 0) {
-      streamedPrefix += outcome.content;
-      if (hasEmittedVisibleContent && !/\s$/.test(streamedPrefix)) {
-        needsSeparatorBeforeNextVisible = true;
+      if (outcome.toolCalls.length === 0) {
+        modelReply = outcome.content;
+        hasFinalReply = true;
+        break;
       }
+
+      if (outcome.content.length > 0) {
+        streamedPrefix += outcome.content;
+        if (hasEmittedVisibleContent && !/\s$/.test(streamedPrefix)) {
+          needsSeparatorBeforeNextVisible = true;
+        }
+      }
+
+      toolRounds += 1;
+      toolsCalled.push(...extractToolNames(outcome.toolCalls));
+
+      await executeAndAppendToolRound({
+        toolCalls: outcome.toolCalls,
+        assistantContent: outcome.content || null,
+        messages: context.messages,
+        candidateBooks,
+        runToolCall: context.runToolCall,
+        toolDeps: deps?.toolDeps,
+        signal,
+      });
     }
 
-    await executeAndAppendToolRound({
-      toolCalls: outcome.toolCalls,
-      assistantContent: outcome.content || null,
-      messages: context.messages,
+    if (!hasFinalReply) {
+      throwIfAborted(signal);
+
+      const finalStream = await raceWithSignal(
+        openaiClient.chat.completions.create(
+          {
+            ...COMPLETION_BASE_PARAMS,
+            user: context.sessionHash,
+            messages: context.messages,
+            stream: true,
+            stream_options: { include_usage: true },
+          },
+          requestOptions,
+        ),
+        signal,
+      );
+
+      const finalOutcome = await consumeCompletionStream(
+        finalStream,
+        totalUsage,
+        signal,
+        forwardDelta,
+      );
+
+      modelReply = finalOutcome.content;
+    }
+
+    const result = await finalizeChatResult({
+      context,
+      userInputMessage: input.message,
+      rawModelReply: `${streamedPrefix}${modelReply}`,
       candidateBooks,
-      runToolCall: context.runToolCall,
-      toolDeps: deps?.toolDeps,
-      signal,
-    });
-  }
-
-  if (!hasFinalReply) {
-    throwIfAborted(signal);
-
-    const finalStream = await raceWithSignal(
-      openaiClient.chat.completions.create(
-        {
-          ...COMPLETION_BASE_PARAMS,
-          user: context.normalizedToken,
-          messages: context.messages,
-          stream: true,
-          stream_options: { include_usage: true },
-        },
-        requestOptions,
-      ),
-      signal,
-    );
-
-    const finalOutcome = await consumeCompletionStream(
-      finalStream,
       totalUsage,
       signal,
-      forwardDelta,
-    );
-
-    modelReply = finalOutcome.content;
+      onFallback: (fallbackReply) => onDelta?.(fallbackReply),
+    });
+    citedBooksCount = result.data.books.length;
+    return result;
+  } catch (err) {
+    if (isAbortLikeError(err, signal)) {
+      outcomeEvent = "chat.turn.aborted";
+    } else if (err instanceof ConflictError) {
+      outcomeEvent = "chat.turn.rejected";
+    } else {
+      outcomeEvent = "chat.turn.failed";
+    }
+    throw err;
+  } finally {
+    if (context) {
+      await releaseSessionLock(
+        context.redisClient,
+        context.lockKey,
+        context.lockOwner,
+      );
+    }
+    try {
+      const normalizedToken = input.token.trim();
+      emitTurnLog({
+        logger,
+        event: outcomeEvent,
+        mode: "stream",
+        sessionHash:
+          context?.sessionHash ??
+          (normalizedToken ? hashSessionToken(normalizedToken) : "invalid"),
+        toolsCalled,
+        toolRounds,
+        totalUsage,
+        startedAtMs,
+        citedBooksCount,
+      });
+    } catch {
+      // Never allow logger errors to mask the turn outcome
+    }
   }
-
-  return finalizeChatResult({
-    context,
-    userInputMessage: input.message,
-    rawModelReply: `${streamedPrefix}${modelReply}`,
-    candidateBooks,
-    totalUsage,
-    signal,
-    onFallback: (fallbackReply) => onDelta?.(fallbackReply),
-  });
 }

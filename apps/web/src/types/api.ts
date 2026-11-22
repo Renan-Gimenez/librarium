@@ -108,6 +108,7 @@ export interface ChatMessage {
   books?: CitedBook[];
   isCancelled?: boolean;
   isStreaming?: boolean;
+  isSystemNotice?: boolean;
 }
 
 export interface ChatStreamDeltaEvent {

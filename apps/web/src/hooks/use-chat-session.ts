@@ -82,9 +82,14 @@ export function clearSession(): void {
   }
 }
 
+export interface TouchSessionResult {
+  sessionId: string;
+  expired: boolean;
+}
+
 export interface UseChatSessionReturn {
   sessionId: string;
-  touchSession: () => void;
+  touchSession: () => TouchSessionResult;
   resetSession: () => string;
 }
 
@@ -108,7 +113,7 @@ export function useChatSession(): UseChatSessionReturn {
     return newId;
   });
 
-  const touchSession = React.useCallback(() => {
+  const touchSession = React.useCallback((): TouchSessionResult => {
     const now = Date.now();
     const stored = getStoredSession(now);
 
@@ -117,7 +122,7 @@ export function useChatSession(): UseChatSessionReturn {
       const newId = generateUUID();
       saveSession({ sessionId: newId, lastActiveAt: now });
       setSessionId(newId);
-      return;
+      return { sessionId: newId, expired: true };
     }
 
     if (stored.sessionId !== sessionId) {
@@ -125,6 +130,7 @@ export function useChatSession(): UseChatSessionReturn {
     }
 
     saveSession({ sessionId: stored.sessionId, lastActiveAt: now });
+    return { sessionId: stored.sessionId, expired: false };
   }, [sessionId]);
 
   // Sync across tabs

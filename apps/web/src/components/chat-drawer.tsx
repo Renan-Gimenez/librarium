@@ -14,8 +14,19 @@ import { TypingIndicator } from "@/components/typing-indicator";
 import { AiCitationCard } from "@/components/ai-citation-card";
 import type { Book, ChatMessage } from "@/types/api";
 
+const MAX_CHAT_MESSAGE_LENGTH = 2000;
+const CONCURRENT_TURN_ERROR_MESSAGE =
+  "Já existe uma resposta em andamento nesta sessão. Aguarde a conclusão e tente novamente.";
+
 function extractErrorMessage(err: unknown): string {
   if (err instanceof Error && err.message) {
+    if (
+      /already in progress|concurrent turn|em andamento nesta sess|\(409\)/i.test(
+        err.message,
+      )
+    ) {
+      return CONCURRENT_TURN_ERROR_MESSAGE;
+    }
     return err.message;
   }
   return "Ocorreu um erro ao comunicar com o assistente.";
@@ -26,6 +37,9 @@ const PROMPT_STARTERS = [
   "Quais são os livros mais bem avaliados do acervo?",
   "Quero um livro sobre cosmologia e buracos negros",
 ] as const;
+
+const SESSION_EXPIRED_NOTICE =
+  "Sessão expirada após 1h de inatividade — iniciando novo contexto";
 
 function wrapStreamingChildren(children: React.ReactNode): React.ReactNode {
   return React.Children.map(children, (child, childIndex) => {
@@ -162,7 +176,7 @@ export function ChatDrawer({
   initialPrompt = "",
   onSelectBook,
 }: ChatDrawerProps) {
-  const { sessionId, touchSession } = useChatSession();
+  const { touchSession } = useChatSession();
   const [inputValue, setInputValue] = React.useState(initialPrompt);
   const [prevPrompt, setPrevPrompt] = React.useState(initialPrompt);
   const [messages, setMessages] = React.useState<ChatMessage[]>([]);
@@ -253,11 +267,36 @@ export function ChatDrawer({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading, error, isStreamingMessage, cancelScheduledScroll]);
 
+  const appendSessionExpiredNotice = React.useCallback(() => {
+    setMessages((prev) => {
+      if (prev.length === 0) {
+        return prev;
+      }
+      const lastMessage = prev[prev.length - 1];
+      if (lastMessage?.isSystemNotice) {
+        return prev;
+      }
+      return [
+        ...prev,
+        {
+          id: `notice-${Date.now()}-${++msgSeqRef.current}`,
+          role: "assistant",
+          content: SESSION_EXPIRED_NOTICE,
+          isSystemNotice: true,
+          createdAt: new Date().toISOString(),
+        },
+      ];
+    });
+  }, []);
+
   // Keep isOpenRef synchronized, touch session and focus input when drawer opens
   React.useEffect(() => {
     isOpenRef.current = isOpen;
     if (isOpen) {
-      touchSession();
+      const { expired } = touchSession();
+      if (expired) {
+        appendSessionExpiredNotice();
+      }
       const timer = setTimeout(() => {
         if (isOpenRef.current) {
           inputRef.current?.focus();
@@ -265,7 +304,7 @@ export function ChatDrawer({
       }, 100);
       return () => clearTimeout(timer);
     }
-  }, [isOpen, touchSession]);
+  }, [isOpen, touchSession, appendSessionExpiredNotice]);
 
   // Abort pending request and clear focus timer when drawer closes or unmounts
   React.useEffect(() => {
@@ -296,7 +335,15 @@ export function ChatDrawer({
     const trimmed = textToSend.trim();
     if (!trimmed || isLoading) return;
 
-    touchSession();
+    if (trimmed.length > MAX_CHAT_MESSAGE_LENGTH) {
+      setError("A mensagem não pode ultrapassar 2000 caracteres.");
+      return;
+    }
+
+    const { sessionId: activeSessionId, expired } = touchSession();
+    if (expired) {
+      appendSessionExpiredNotice();
+    }
     isUserNearBottomRef.current = true;
     if (!isRetry) {
       setInputValue("");
@@ -358,7 +405,7 @@ export function ChatDrawer({
       const response = await streamChatMessage(
         {
           message: trimmed,
-          sessionId,
+          sessionId: activeSessionId,
         },
         {
           signal: controller.signal,
@@ -566,6 +613,22 @@ export function ChatDrawer({
 
           {/* Messages List */}
           {messages.map((message) => {
+            if (message.isSystemNotice) {
+              return (
+                <div
+                  key={message.id}
+                  role="status"
+                  className="flex items-center gap-3 py-1"
+                >
+                  <div className="h-px flex-1 bg-[#272A34]" />
+                  <span className="font-ui text-[11px] text-[#A1A1AA] text-center">
+                    {message.content}
+                  </span>
+                  <div className="h-px flex-1 bg-[#272A34]" />
+                </div>
+              );
+            }
+
             if (message.role === "user") {
               return (
                 <div key={message.id} className="flex justify-end">
@@ -681,6 +744,7 @@ export function ChatDrawer({
             <input
               ref={inputRef}
               type="text"
+              maxLength={MAX_CHAT_MESSAGE_LENGTH}
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={handleKeyDown}
