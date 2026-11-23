@@ -172,7 +172,6 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
     {
       schema: {
         tags: ["Chat"],
-        summary: "Get chat session history",
         description:
           "Returns the recent chat message history stored in Redis for the current session without renewing its TTL or acquiring a turn lock.",
         security: [
@@ -209,7 +208,6 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
     {
       schema: {
         tags: ["Chat"],
-        summary: "Clear chat session history",
         description:
           "Deletes the chat session history key stored in Redis for the current session.",
         security: [
@@ -293,7 +291,6 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
       },
       schema: {
         tags: ["Chat"],
-        summary: "Stream AI chat response via Server-Sent Events (SSE)",
         description:
           "Receives a user message and streams assistant tokens in real time via Server-Sent Events (delta, done, error), executing tool calling against the catalog and storing finalized turns in Redis.",
         security: [
