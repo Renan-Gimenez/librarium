@@ -2,7 +2,12 @@ import { describe, expect, it, spyOn } from "bun:test";
 import type { AxiosResponse, InternalAxiosRequestConfig } from "axios";
 
 import { api } from "@/lib/api";
-import { sendChatMessage, streamChatMessage } from "./chat";
+import {
+  clearChatHistory,
+  fetchChatHistory,
+  sendChatMessage,
+  streamChatMessage,
+} from "./chat";
 import type { ChatApiResponse } from "@/types/api";
 
 function createAxiosResponse<T>(data: T, status = 200): AxiosResponse<T> {
@@ -549,6 +554,81 @@ describe("chat service", () => {
         "Resposta inesperada do servidor (formato não suportado).",
       );
       html200Spy.mockRestore();
+    });
+  });
+
+  describe("fetchChatHistory", () => {
+    it("throws validation error if sessionId is empty or whitespace", async () => {
+      await expect(fetchChatHistory("   ")).rejects.toThrow(
+        "Um sessionId válido é obrigatório.",
+      );
+    });
+
+    it("fetches /chat/history with Bearer header and signal and returns messages", async () => {
+      const historyMessages = [
+        {
+          id: "m1",
+          role: "user" as const,
+          content: "Indique um livro",
+          createdAt: "2026-11-23T10:00:00.000Z",
+        },
+        {
+          id: "m2",
+          role: "assistant" as const,
+          content: "Recomendo Duna.",
+          createdAt: "2026-11-23T10:00:02.000Z",
+          books: [
+            {
+              id: "b1",
+              title: "Duna",
+              author: "Frank Herbert",
+            },
+          ],
+        },
+      ];
+
+      const getSpy = spyOn(api, "get").mockResolvedValueOnce({
+        data: { messages: historyMessages },
+      } as never);
+      const controller = new AbortController();
+
+      const result = await fetchChatHistory("session-hist-1", controller.signal);
+
+      expect(result).toEqual(historyMessages);
+      expect(getSpy).toHaveBeenCalledWith(
+        "/chat/history",
+        expect.objectContaining({
+          headers: { Authorization: "Bearer session-hist-1" },
+          signal: controller.signal,
+        }),
+      );
+
+      getSpy.mockRestore();
+    });
+  });
+
+  describe("clearChatHistory", () => {
+    it("throws validation error if sessionId is empty or whitespace", async () => {
+      await expect(clearChatHistory("")).rejects.toThrow(
+        "Um sessionId válido é obrigatório.",
+      );
+    });
+
+    it("calls DELETE /chat/history with Bearer header", async () => {
+      const deleteSpy = spyOn(api, "delete").mockResolvedValueOnce({
+        data: { success: true },
+      } as never);
+
+      await clearChatHistory("session-clear-1");
+
+      expect(deleteSpy).toHaveBeenCalledWith(
+        "/chat/history",
+        expect.objectContaining({
+          headers: { Authorization: "Bearer session-clear-1" },
+        }),
+      );
+
+      deleteSpy.mockRestore();
     });
   });
 });

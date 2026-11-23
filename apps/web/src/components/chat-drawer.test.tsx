@@ -1133,4 +1133,217 @@ describe("ChatDrawer Component", () => {
       sendSpy.mockRestore();
     }
   });
+
+  it("hydrates chat history with cited book cards after remount (F5) when active session exists", async () => {
+    localStorage.clear();
+    const activeId = "f5-session-123";
+    saveSession({
+      sessionId: activeId,
+      lastActiveAt: Date.now() - 5 * 60 * 1000,
+    });
+
+    const onSelectBook = mock();
+    const fetchHistorySpy = spyOn(
+      chatService,
+      "fetchChatHistory",
+    ).mockResolvedValueOnce([
+      {
+        id: "hist-u1",
+        role: "user",
+        content: "Me indique um livro de ficção científica",
+        createdAt: "2026-11-23T10:00:00.000Z",
+      },
+      {
+        id: "hist-a1",
+        role: "assistant",
+        content: "Recomendo **Solaris** para essa leitura.",
+        createdAt: "2026-11-23T10:00:02.000Z",
+        books: [
+          {
+            id: "book-solaris",
+            title: "Solaris",
+            author: "Stanislaw Lem",
+            rating: 4.8,
+            similarity: 93,
+            genres: [{ slug: "ficcao-cientifica", name: "Ficção Científica" }],
+          },
+        ],
+      },
+    ]);
+
+    try {
+      render(
+        <ChatDrawer
+          isOpen={true}
+          onClose={() => {}}
+          onSelectBook={onSelectBook}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(
+          screen.getByText("Me indique um livro de ficção científica"),
+        ).toBeDefined();
+      });
+
+      expect(fetchHistorySpy).toHaveBeenCalledTimes(1);
+      expect(fetchHistorySpy.mock.calls[0]?.[0]).toBe(activeId);
+      expect(screen.queryByText("Sugestões para começar")).toBeNull();
+      expect(screen.getByText("Stanislaw Lem")).toBeDefined();
+
+      fireEvent.click(screen.getByRole("button", { name: /Solaris/i }));
+      expect(onSelectBook).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchHistorySpy.mockRestore();
+    }
+  });
+
+  it("keeps chat usable when fetchChatHistory fails on mount", async () => {
+    localStorage.clear();
+    const fetchHistorySpy = spyOn(
+      chatService,
+      "fetchChatHistory",
+    ).mockRejectedValueOnce(new Error("Network error"));
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockResolvedValueOnce({
+      data: {
+        userMessage: "Olá",
+        modelReply: "Tudo certo!",
+        books: [],
+      },
+      meta: {
+        usage: { promptTokens: 5, completionTokens: 5, totalTokens: 10 },
+      },
+    });
+
+    try {
+      render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+      await waitFor(() => {
+        expect(fetchHistorySpy).toHaveBeenCalledTimes(1);
+      });
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByText("Sugestões para começar")).toBeDefined();
+
+      const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+      fireEvent.change(input, { target: { value: "Olá" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("Tudo certo!")).toBeDefined();
+      });
+    } finally {
+      fetchHistorySpy.mockRestore();
+      sendSpy.mockRestore();
+    }
+  });
+
+  it("does not overwrite local messages if user sends a message before hydration resolves", async () => {
+    localStorage.clear();
+    let resolveHistory!: (value: Awaited<ReturnType<typeof chatService.fetchChatHistory>>) => void;
+    const fetchHistorySpy = spyOn(
+      chatService,
+      "fetchChatHistory",
+    ).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveHistory = resolve;
+        }),
+    );
+    const sendSpy = spyOn(chatService, "streamChatMessage").mockResolvedValueOnce({
+      data: {
+        userMessage: "Minha nova pergunta",
+        modelReply: "Minha nova resposta",
+        books: [],
+      },
+      meta: {
+        usage: { promptTokens: 5, completionTokens: 5, totalTokens: 10 },
+      },
+    });
+
+    try {
+      render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+      const input = screen.getByPlaceholderText("Pergunte sobre o acervo...");
+      fireEvent.change(input, { target: { value: "Minha nova pergunta" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensagem" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("Minha nova resposta")).toBeDefined();
+      });
+
+      await act(async () => {
+        resolveHistory([
+          {
+            id: "stale-u1",
+            role: "user",
+            content: "Mensagem antiga obsoleta",
+            createdAt: "2026-11-23T09:00:00.000Z",
+          },
+        ]);
+      });
+
+      expect(screen.queryByText("Mensagem antiga obsoleta")).toBeNull();
+      expect(screen.getByText("Minha nova pergunta")).toBeDefined();
+      expect(screen.getByText("Minha nova resposta")).toBeDefined();
+    } finally {
+      fetchHistorySpy.mockRestore();
+      sendSpy.mockRestore();
+    }
+  });
+
+  it("resets conversation, generates new sessionId, and calls clearChatHistory even if DELETE fails", async () => {
+    localStorage.clear();
+    const initialId = "reset-session-initial";
+    saveSession({
+      sessionId: initialId,
+      lastActiveAt: Date.now(),
+    });
+
+    const fetchHistorySpy = spyOn(
+      chatService,
+      "fetchChatHistory",
+    ).mockResolvedValueOnce([
+      {
+        id: "u1",
+        role: "user",
+        content: "Pergunta anterior",
+        createdAt: "2026-11-23T10:00:00.000Z",
+      },
+      {
+        id: "a1",
+        role: "assistant",
+        content: "Resposta anterior",
+        createdAt: "2026-11-23T10:00:01.000Z",
+      },
+    ]);
+    const clearSpy = spyOn(
+      chatService,
+      "clearChatHistory",
+    ).mockRejectedValueOnce(new Error("Network failure"));
+
+    try {
+      render(<ChatDrawer isOpen={true} onClose={() => {}} />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Pergunta anterior")).toBeDefined();
+      });
+
+      const resetBtn = screen.getByRole("button", { name: "Nova conversa" });
+      fireEvent.click(resetBtn);
+
+      expect(clearSpy).toHaveBeenCalledWith(initialId);
+      expect(screen.queryByText("Pergunta anterior")).toBeNull();
+      expect(screen.queryByText("Resposta anterior")).toBeNull();
+      expect(screen.getByText("Sugestões para começar")).toBeDefined();
+
+      const storedRaw = localStorage.getItem(CHAT_SESSION_STORAGE_KEY);
+      expect(storedRaw).toBeTruthy();
+      const stored = JSON.parse(storedRaw!) as { sessionId: string };
+      expect(stored.sessionId).not.toBe(initialId);
+    } finally {
+      fetchHistorySpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  });
 });

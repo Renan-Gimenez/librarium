@@ -12,7 +12,9 @@ import { ConflictError } from "@/errors";
 import { buildSystemPrompt } from "./chat.prompts";
 import {
   CHAT_LOCK_TTL_SECONDS,
+  clearChatHistory,
   FALLBACK_EMPTY_REPLY,
+  getChatHistory,
   hashSessionToken,
   isBookCitedInReply,
   MAX_TOOL_ROUNDS,
@@ -2550,6 +2552,223 @@ describe("chat.service > streamChatMessage", () => {
       expect(
         setAbortLocks.has("chat:session:session-abort-during-set:lock"),
       ).toBe(false);
+    });
+  });
+
+  describe("Story 5.6: getChatHistory, clearChatHistory, and persisted cited books", () => {
+    it("persists cited books on StoredChatMessage in Redis without sending books to OpenAI on subsequent turns", async () => {
+      const solaris = makeSimilarBook({
+        id: "book-solaris",
+        title: "Solaris",
+        author: "Stanislaw Lem",
+      });
+      const redisList = new Map<string, string[]>();
+      const openAiBodies: ChatCompletionCreateParamsNonStreaming[] = [];
+
+      const redisMock = {
+        get: mock(async () => null),
+        set: mock(async () => "OK"),
+        lrange: mock(async (key: string, start: number, stop: number) => {
+          const arr = redisList.get(key) ?? [];
+          const len = arr.length;
+          const s = start < 0 ? Math.max(0, len + start) : start;
+          const e = stop < 0 ? len + stop : stop;
+          return arr.slice(s, e + 1);
+        }),
+        eval: mock(async () => 1),
+        multi: () => {
+          const ops: Array<() => void> = [];
+          const chain = {
+            del: (key: string) => {
+              ops.push(() => redisList.delete(key));
+              return chain;
+            },
+            rpush: (key: string, ...values: string[]) => {
+              ops.push(() => {
+                const existing = redisList.get(key) ?? [];
+                redisList.set(key, [...existing, ...values]);
+              });
+              return chain;
+            },
+            ltrim: (key: string, start: number, stop: number) => {
+              ops.push(() => {
+                const arr = redisList.get(key) ?? [];
+                const len = arr.length;
+                const s = start < 0 ? Math.max(0, len + start) : start;
+                const e = stop < 0 ? len + stop : stop;
+                redisList.set(key, arr.slice(s, e + 1));
+              });
+              return chain;
+            },
+            expire: () => chain,
+            exec: async () => {
+              for (const op of ops) op();
+              return ops.map(() => [null, "OK"]);
+            },
+          };
+          return chain;
+        },
+      };
+
+      let turn = 0;
+      const deps: ChatServiceDeps = {
+        prisma: {
+          genre: {
+            findMany: mock(async () => [
+              { slug: "ficcao-cientifica", name: "Ficção Científica" },
+            ]),
+          },
+        },
+        redis: redisMock,
+        openai: {
+          chat: {
+            completions: {
+              create: mock(async (body: ChatCompletionCreateParamsNonStreaming) => {
+                openAiBodies.push(body);
+                turn += 1;
+                if (turn === 1) {
+                  return makeCompletion({
+                    toolCalls: [
+                      makeToolCall(
+                        "call-sem-1",
+                        "searchSemanticBooks",
+                        JSON.stringify({ query: "solidão no espaço" }),
+                      ),
+                    ],
+                  });
+                }
+                if (turn === 2) {
+                  return makeCompletion({
+                    content: "Recomendo Solaris, de Stanislaw Lem.",
+                  });
+                }
+                return makeCompletion({
+                  content: "Ele foi publicado originalmente em 1961.",
+                });
+              }),
+            },
+          },
+        },
+        executeToolCall: mock(async (toolCall) => ({
+          toolCallId: toolCall.id,
+          content: JSON.stringify([solaris]),
+          books: [
+            {
+              id: solaris.id,
+              title: solaris.title,
+              author: solaris.author,
+              description: solaris.description,
+              coverUrl: solaris.coverUrl,
+              rating: solaris.rating,
+              publishedAt: solaris.publishedAt,
+              genres: solaris.genres,
+              similarity: solaris.similarity,
+            },
+          ],
+        })),
+      };
+
+      await processChatMessage(
+        { token: "session-books-persist", message: "Indique sci-fi" },
+        deps,
+      );
+
+      const historyResult = await getChatHistory("session-books-persist", {
+        redis: redisMock,
+      });
+      expect(historyResult.messages).toHaveLength(2);
+      expect(historyResult.messages[0]?.books).toBeUndefined();
+      expect(historyResult.messages[1]?.books).toEqual([
+        expect.objectContaining({
+          id: "book-solaris",
+          title: "Solaris",
+          author: "Stanislaw Lem",
+          similarity: 86,
+        }),
+      ]);
+
+      // Turn 2: OpenAI messages must NOT include `books`
+      await processChatMessage(
+        { token: "session-books-persist", message: "De que ano é?" },
+        deps,
+      );
+
+      const secondTurnBody = openAiBodies[2]!;
+      const historyMessagesSentToOpenAi = secondTurnBody.messages.slice(1, 3);
+      expect(historyMessagesSentToOpenAi).toEqual([
+        { role: "user", content: "Indique sci-fi" },
+        { role: "assistant", content: "Recomendo Solaris, de Stanislaw Lem." },
+      ]);
+      expect("books" in (historyMessagesSentToOpenAi[1] as object)).toBe(false);
+    });
+
+    it("getChatHistory returns empty array when key does not exist, handles legacy messages without books, and never acquires lock or renews TTL", async () => {
+      const setSpy = mock(async () => "OK");
+      const lrangeSpy = mock(async () => []);
+      const getSpy = mock(async () => null);
+
+      const emptyResult = await getChatHistory("session-empty", {
+        redis: {
+          get: getSpy,
+          set: setSpy,
+          lrange: lrangeSpy,
+        },
+      });
+
+      expect(emptyResult).toEqual({ messages: [] });
+      expect(setSpy).not.toHaveBeenCalled();
+
+      const legacyMessages: StoredChatMessage[] = [
+        {
+          id: "u1",
+          role: "user",
+          content: "Olá",
+          createdAt: "2026-11-23T10:00:00.000Z",
+        },
+        {
+          id: "a1",
+          role: "assistant",
+          content: "Olá! Como posso ajudar?",
+          createdAt: "2026-11-23T10:00:02.000Z",
+        },
+      ];
+
+      const legacyResult = await getChatHistory("session-legacy", {
+        redis: {
+          get: getSpy,
+          set: setSpy,
+          lrange: mock(async () =>
+            legacyMessages.map((m) => JSON.stringify(m)),
+          ),
+        },
+      });
+
+      expect(legacyResult.messages).toEqual(legacyMessages);
+      expect(legacyResult.messages[1]?.books).toBeUndefined();
+      expect(setSpy).not.toHaveBeenCalled();
+    });
+
+    it("getChatHistory and clearChatHistory reject empty tokens and clearChatHistory deletes the Redis key", async () => {
+      await expect(getChatHistory("   ")).rejects.toThrow(
+        "Session token is required",
+      );
+      await expect(clearChatHistory("   ")).rejects.toThrow(
+        "Session token is required",
+      );
+
+      const delSpy = mock(async () => 1);
+      await clearChatHistory("session-to-clear", {
+        redis: {
+          get: mock(async () => null),
+          set: mock(async () => "OK"),
+          del: delSpy,
+        },
+      });
+
+      expect(delSpy).toHaveBeenCalledTimes(1);
+      expect(delSpy).toHaveBeenCalledWith(
+        "chat:session:session-to-clear:messages",
+      );
     });
   });
 });
