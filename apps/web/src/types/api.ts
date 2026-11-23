@@ -123,6 +123,10 @@ export interface ChatApiRequest {
   message: string;
 }
 
+export interface ChatHistoryResponse {
+  messages: ChatMessage[];
+}
+
 export interface ChatApiResponse {
   data: {
     userMessage: string;

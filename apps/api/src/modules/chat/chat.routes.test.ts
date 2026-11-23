@@ -732,4 +732,126 @@ describe("chat.routes", () => {
       });
     });
   });
+
+  describe("GET /api/chat/history", () => {
+    it("returns 401 when Bearer token is missing", async () => {
+      const getHistoryMock = mock(async () => ({ messages: [] }));
+      const app = buildTestApp({ getHistory: getHistoryMock });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/chat/history",
+      });
+
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ message: "Invalid API Key" });
+      expect(getHistoryMock).not.toHaveBeenCalled();
+
+      await app.close();
+    });
+
+    it("returns 200 with messages including cited books when session has history", async () => {
+      const storedMessages = [
+        {
+          id: "msg-1",
+          role: "user" as const,
+          content: "Indique ficção científica",
+          createdAt: "2026-11-23T10:00:00.000Z",
+        },
+        {
+          id: "msg-2",
+          role: "assistant" as const,
+          content: "Recomendo Solaris.",
+          createdAt: "2026-11-23T10:00:03.000Z",
+          books: [
+            {
+              id: "book-1",
+              title: "Solaris",
+              author: "Stanislaw Lem",
+              description: "Clássico de ficção científica.",
+              coverUrl: null,
+              rating: 4.8,
+              publishedAt: "1961-01-01T00:00:00.000Z",
+              genres: [{ slug: "ficcao-cientifica", name: "Ficção Científica" }],
+              similarity: 92,
+            },
+          ],
+        },
+      ];
+
+      const getHistoryMock = mock(async () => ({
+        messages: storedMessages,
+      }));
+      const app = buildTestApp({ getHistory: getHistoryMock });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/chat/history",
+        headers: {
+          authorization: "Bearer session-history-1",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(getHistoryMock).toHaveBeenCalledWith("session-history-1");
+      expect(response.json()).toEqual({ messages: storedMessages });
+
+      await app.close();
+    });
+
+    it("returns 200 with empty messages array when session has no history", async () => {
+      const getHistoryMock = mock(async () => ({ messages: [] }));
+      const app = buildTestApp({ getHistory: getHistoryMock });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/chat/history",
+        headers: {
+          authorization: "Bearer session-empty-1",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ messages: [] });
+
+      await app.close();
+    });
+  });
+
+  describe("DELETE /api/chat/history", () => {
+    it("returns 401 when Bearer token is missing", async () => {
+      const clearHistoryMock = mock(async () => {});
+      const app = buildTestApp({ clearHistory: clearHistoryMock });
+
+      const response = await app.inject({
+        method: "DELETE",
+        url: "/api/chat/history",
+      });
+
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ message: "Invalid API Key" });
+      expect(clearHistoryMock).not.toHaveBeenCalled();
+
+      await app.close();
+    });
+
+    it("returns 200 and delegates to clearHistory with session token", async () => {
+      const clearHistoryMock = mock(async () => {});
+      const app = buildTestApp({ clearHistory: clearHistoryMock });
+
+      const response = await app.inject({
+        method: "DELETE",
+        url: "/api/chat/history",
+        headers: {
+          authorization: "Bearer session-delete-1",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(clearHistoryMock).toHaveBeenCalledWith("session-delete-1");
+      expect(response.json()).toEqual({ success: true });
+
+      await app.close();
+    });
+  });
 });

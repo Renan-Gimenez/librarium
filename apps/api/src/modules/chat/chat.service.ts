@@ -39,6 +39,7 @@ export interface StoredChatMessage {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  books?: ChatResponseBook[];
 }
 
 export interface ChatResponseBook {
@@ -115,6 +116,7 @@ export interface ChatServiceBaseDeps {
       ): Promise<unknown>;
     };
     lrange?: (key: string, start: number, stop: number) => Promise<string[]>;
+    del?: (key: string) => Promise<unknown>;
     eval?: (
       script: string,
       numkeys: number,
@@ -617,6 +619,12 @@ async function finalizeChatResult(params: {
 
   throwIfAborted(signal);
 
+  const citedBooks = usedFallback
+    ? []
+    : Array.from(candidateBooks.values())
+        .filter((book) => isBookCitedInReply(book.title, modelReply))
+        .map(toCitedBook);
+
   const userMessage: StoredChatMessage = {
     id: context.generateId(),
     role: "user",
@@ -629,6 +637,7 @@ async function finalizeChatResult(params: {
     role: "assistant",
     content: modelReply,
     createdAt: context.now().toISOString(),
+    ...(citedBooks.length > 0 && { books: citedBooks }),
   };
 
   if (context.sessionTtl > 0) {
@@ -686,12 +695,6 @@ async function finalizeChatResult(params: {
   if (usedFallback) {
     onFallback?.(modelReply);
   }
-
-  const citedBooks = usedFallback
-    ? []
-    : Array.from(candidateBooks.values())
-        .filter((book) => isBookCitedInReply(book.title, modelReply))
-        .map(toCitedBook);
 
   return {
     data: {
@@ -1206,4 +1209,76 @@ export async function streamChatMessage(
       // Never allow logger errors to mask the turn outcome
     }
   }
+}
+
+export interface GetChatHistoryResult {
+  messages: StoredChatMessage[];
+}
+
+export async function getChatHistory(
+  token: string,
+  deps?: ChatServiceBaseDeps,
+): Promise<GetChatHistoryResult> {
+  const normalizedToken = token.trim();
+  if (!normalizedToken) {
+    throw new Error("Session token is required");
+  }
+
+  const redisClient: NonNullable<ChatServiceBaseDeps["redis"]> =
+    deps?.redis ?? redis;
+  const historyWindow = deps?.historyWindow ?? env.CHAT_HISTORY_WINDOW;
+  const generateId = deps?.generateId ?? (() => crypto.randomUUID());
+  const now = deps?.now ?? (() => new Date());
+  const redisKey = `chat:session:${normalizedToken}:messages`;
+
+  const { messageHistory } = await loadChatHistory(
+    redisClient,
+    redisKey,
+    historyWindow,
+  );
+
+  const messages: StoredChatMessage[] = messageHistory.map((msg) => {
+    const validBooks = Array.isArray(msg.books)
+      ? msg.books.filter(
+          (b): b is ChatResponseBook =>
+            Boolean(b) &&
+            typeof b.id === "string" &&
+            typeof b.title === "string" &&
+            typeof b.author === "string",
+        )
+      : [];
+
+    return {
+      id: typeof msg.id === "string" && msg.id ? msg.id : generateId(),
+      role: msg.role,
+      content: msg.content,
+      createdAt:
+        typeof msg.createdAt === "string" && msg.createdAt
+          ? msg.createdAt
+          : now().toISOString(),
+      ...(validBooks.length > 0 ? { books: validBooks } : {}),
+    };
+  });
+
+  return { messages };
+}
+
+export async function clearChatHistory(
+  token: string,
+  deps?: ChatServiceBaseDeps,
+): Promise<void> {
+  const normalizedToken = token.trim();
+  if (!normalizedToken) {
+    throw new Error("Session token is required");
+  }
+
+  const redisClient: NonNullable<ChatServiceBaseDeps["redis"]> =
+    deps?.redis ?? redis;
+  const redisKey = `chat:session:${normalizedToken}:messages`;
+
+  if (typeof redisClient.del !== "function") {
+    throw new Error("Redis del method unavailable");
+  }
+
+  await redisClient.del(redisKey);
 }
