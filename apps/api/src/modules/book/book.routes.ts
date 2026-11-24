@@ -152,7 +152,7 @@ export const booksRoutes: FastifyPluginAsyncZod<BookRoutesOptions> = async (
     {
       schema: {
         tags: ["Books"],
-        summary: "Find similar books for a given book",
+        description: "Find similar books for a given book",
         params: z.object({
           id: z.string(),
         }),

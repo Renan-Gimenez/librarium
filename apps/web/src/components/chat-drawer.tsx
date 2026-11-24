@@ -1,6 +1,6 @@
 import * as React from "react";
 import ReactMarkdown from "react-markdown";
-import { ArrowUp, Sparkles, Square, X } from "lucide-react";
+import { ArrowUp, RotateCcw, Sparkles, Square, X } from "lucide-react";
 import {
   Sheet,
   SheetContent,
@@ -9,7 +9,11 @@ import {
   SheetTitle,
 } from "@repo/ui";
 import { useChatSession } from "@/hooks/use-chat-session";
-import { streamChatMessage } from "@/services/chat";
+import {
+  clearChatHistory,
+  fetchChatHistory,
+  streamChatMessage,
+} from "@/services/chat";
 import { TypingIndicator } from "@/components/typing-indicator";
 import { AiCitationCard } from "@/components/ai-citation-card";
 import type { Book, ChatMessage } from "@/types/api";
@@ -176,7 +180,7 @@ export function ChatDrawer({
   initialPrompt = "",
   onSelectBook,
 }: ChatDrawerProps) {
-  const { touchSession } = useChatSession();
+  const { sessionId, touchSession, resetSession } = useChatSession();
   const [inputValue, setInputValue] = React.useState(initialPrompt);
   const [prevPrompt, setPrevPrompt] = React.useState(initialPrompt);
   const [messages, setMessages] = React.useState<ChatMessage[]>([]);
@@ -194,6 +198,19 @@ export function ChatDrawer({
   const scrollCancelRef = React.useRef<(() => void) | null>(null);
   const isOpenRef = React.useRef(isOpen);
   const msgSeqRef = React.useRef(0);
+  const messagesRef = React.useRef<ChatMessage[]>(messages);
+  const sessionIdRef = React.useRef(sessionId);
+  const hydratedSessionIdRef = React.useRef<string | null>(null);
+  const hasLocalActivityRef = React.useRef(false);
+  const hydrationAbortRef = React.useRef<AbortController | null>(null);
+
+  React.useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  React.useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
 
   // Sync state with prop change without setState in useEffect
   if (initialPrompt !== prevPrompt) {
@@ -293,8 +310,10 @@ export function ChatDrawer({
   React.useEffect(() => {
     isOpenRef.current = isOpen;
     if (isOpen) {
-      const { expired } = touchSession();
+      const { sessionId: activeSessionId, expired } = touchSession();
       if (expired) {
+        sessionIdRef.current = activeSessionId;
+        hydratedSessionIdRef.current = activeSessionId;
         appendSessionExpiredNotice();
       }
       const timer = setTimeout(() => {
@@ -306,19 +325,89 @@ export function ChatDrawer({
     }
   }, [isOpen, touchSession, appendSessionExpiredNotice]);
 
+  // Hydrate messages from Redis when drawer opens with an active session
+  React.useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    if (hydratedSessionIdRef.current === sessionId || sessionIdRef.current !== sessionId) {
+      return;
+    }
+
+    if (messagesRef.current.length > 0 || hasLocalActivityRef.current) {
+      hydratedSessionIdRef.current = sessionId;
+      return;
+    }
+
+    hydrationAbortRef.current?.abort();
+    const controller = new AbortController();
+    hydrationAbortRef.current = controller;
+    const targetSessionId = sessionId;
+
+    void fetchChatHistory(targetSessionId, controller.signal)
+      .then((history) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        hydratedSessionIdRef.current = targetSessionId;
+        if (
+          sessionIdRef.current !== targetSessionId ||
+          hasLocalActivityRef.current ||
+          messagesRef.current.length > 0 ||
+          history.length === 0
+        ) {
+          return;
+        }
+        setMessages(history);
+      })
+      .catch(() => {
+        // Silent failure: keep chat usable without blocking new messages
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [isOpen, sessionId]);
+
   // Abort pending request and clear focus timer when drawer closes or unmounts
   React.useEffect(() => {
     if (!isOpen) {
       clearFocusTimer();
       cancelledByUserRef.current = false;
       abortControllerRef.current?.abort();
+      hydrationAbortRef.current?.abort();
     }
     return () => {
       clearFocusTimer();
       cancelledByUserRef.current = false;
       abortControllerRef.current?.abort();
+      hydrationAbortRef.current?.abort();
     };
   }, [isOpen, clearFocusTimer]);
+
+  const handleResetConversation = () => {
+    const previousSessionId = sessionIdRef.current;
+
+    cancelledByUserRef.current = false;
+    abortControllerRef.current?.abort();
+    hydrationAbortRef.current?.abort();
+    failedStreamingMessageIdRef.current = null;
+    hasLocalActivityRef.current = false;
+
+    const newSessionId = resetSession();
+    hydratedSessionIdRef.current = newSessionId;
+
+    setMessages([]);
+    setError(null);
+    setIsLoading(false);
+
+    void clearChatHistory(previousSessionId).catch(() => {
+      // Best-effort: local reset proceeds even if DELETE fails
+    });
+
+    inputRef.current?.focus();
+  };
 
   const handleStopGeneration = () => {
     if (!isLoading) return;
@@ -341,6 +430,7 @@ export function ChatDrawer({
     }
 
     const { sessionId: activeSessionId, expired } = touchSession();
+    hasLocalActivityRef.current = true;
     if (expired) {
       appendSessionExpiredNotice();
     }
@@ -563,14 +653,27 @@ export function ChatDrawer({
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Fechar assistente"
-            className="cursor-pointer rounded-full p-2 text-[#A1A1AA] transition-colors hover:bg-[#1C1F26] hover:text-[#F4F4F6] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
-          >
-            <X className="h-4 w-4" aria-hidden="true" />
-          </button>
+          <div className="flex items-center gap-1">
+            {messages.length > 0 && (
+              <button
+                type="button"
+                onClick={handleResetConversation}
+                aria-label="Nova conversa"
+                title="Nova conversa"
+                className="cursor-pointer rounded-full p-2 text-[#A1A1AA] transition-colors hover:bg-[#1C1F26] hover:text-[#F4F4F6] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
+              >
+                <RotateCcw className="h-4 w-4" aria-hidden="true" />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Fechar assistente"
+              className="cursor-pointer rounded-full p-2 text-[#A1A1AA] transition-colors hover:bg-[#1C1F26] hover:text-[#F4F4F6] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C3AED]"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
         </SheetHeader>
 
         {/* Chat Body (Scrollable) */}

@@ -6,11 +6,18 @@ import { env } from "@/config/env";
 import { AppError } from "@/errors";
 import { authMiddleware } from "@/middlewares/auth.middleware";
 
-import { processChatMessage, streamChatMessage } from "./chat.service";
+import {
+  clearChatHistory,
+  getChatHistory,
+  processChatMessage,
+  streamChatMessage,
+} from "./chat.service";
 
 export interface ChatRoutesOptions {
   processMessage?: typeof processChatMessage;
   streamMessage?: typeof streamChatMessage;
+  getHistory?: typeof getChatHistory;
+  clearHistory?: typeof clearChatHistory;
 }
 
 const chatMessageBodySchema = z.object({
@@ -25,6 +32,25 @@ const chatErrorResponseSchema = z.object({
   statusCode: z.number(),
   error: z.string(),
   message: z.string(),
+});
+
+const chatBookSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  author: z.string(),
+  description: z.string().nullable().optional(),
+  coverUrl: z.string().nullable().optional(),
+  rating: z.number().nullable().optional(),
+  publishedAt: z.string().nullable().optional(),
+  genres: z
+    .array(
+      z.object({
+        slug: z.string(),
+        name: z.string(),
+      }),
+    )
+    .optional(),
+  similarity: z.number().optional(),
 });
 
 function writeSseEvent(
@@ -136,8 +162,74 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
 ) => {
   const handleMessage = opts.processMessage ?? processChatMessage;
   const handleStreamMessage = opts.streamMessage ?? streamChatMessage;
+  const handleGetHistory = opts.getHistory ?? getChatHistory;
+  const handleClearHistory = opts.clearHistory ?? clearChatHistory;
 
   app.addHook("preHandler", authMiddleware);
+
+  app.get(
+    "/history",
+    {
+      schema: {
+        tags: ["Chat"],
+        description:
+          "Returns the recent chat message history stored in Redis for the current session without renewing its TTL or acquiring a turn lock.",
+        security: [
+          {
+            bearerAuth: [],
+          },
+        ],
+        response: {
+          200: z.object({
+            messages: z.array(
+              z.object({
+                id: z.string(),
+                role: z.enum(["user", "assistant"]),
+                content: z.string(),
+                createdAt: z.string(),
+                books: z.array(chatBookSchema).optional(),
+              }),
+            ),
+          }),
+        },
+      },
+    },
+    async (req, res) => {
+      const token = req.token!;
+      const result = await handleGetHistory(token);
+
+      res.status(200);
+      return result;
+    },
+  );
+
+  app.delete(
+    "/history",
+    {
+      schema: {
+        tags: ["Chat"],
+        description:
+          "Deletes the chat session history key stored in Redis for the current session.",
+        security: [
+          {
+            bearerAuth: [],
+          },
+        ],
+        response: {
+          200: z.object({
+            success: z.boolean(),
+          }),
+        },
+      },
+    },
+    async (req, res) => {
+      const token = req.token!;
+      await handleClearHistory(token);
+
+      res.status(200);
+      return { success: true };
+    },
+  );
 
   app.post(
     "/",
@@ -163,28 +255,7 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
             data: z.object({
               userMessage: z.string(),
               modelReply: z.string(),
-              books: z
-                .array(
-                  z.object({
-                    id: z.string(),
-                    title: z.string(),
-                    author: z.string(),
-                    description: z.string().nullable().optional(),
-                    coverUrl: z.string().nullable().optional(),
-                    rating: z.number().nullable().optional(),
-                    publishedAt: z.string().nullable().optional(),
-                    genres: z
-                      .array(
-                        z.object({
-                          slug: z.string(),
-                          name: z.string(),
-                        }),
-                      )
-                      .optional(),
-                    similarity: z.number().optional(),
-                  }),
-                )
-                .optional(),
+              books: z.array(chatBookSchema).optional(),
             }),
             meta: z.object({
               usage: z.object({
@@ -220,7 +291,6 @@ export const chatRoutes: FastifyPluginAsyncZod<ChatRoutesOptions> = async (
       },
       schema: {
         tags: ["Chat"],
-        summary: "Stream AI chat response via Server-Sent Events (SSE)",
         description:
           "Receives a user message and streams assistant tokens in real time via Server-Sent Events (delta, done, error), executing tool calling against the catalog and storing finalized turns in Redis.",
         security: [

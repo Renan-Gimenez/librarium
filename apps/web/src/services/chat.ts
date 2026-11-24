@@ -2,6 +2,8 @@ import { api } from "@/lib/api";
 import type {
   ApiErrorResponse,
   ChatApiResponse,
+  ChatHistoryResponse,
+  ChatMessage,
   ChatStreamDeltaEvent,
   ChatStreamErrorEvent,
 } from "@/types/api";
@@ -330,5 +332,39 @@ export async function streamChatMessage(
     }
     reader.releaseLock();
   }
+}
+
+export async function fetchChatHistory(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ChatMessage[]> {
+  const trimmedSessionId = sessionId?.trim();
+  if (!trimmedSessionId) {
+    throw new Error("Um sessionId válido é obrigatório.");
+  }
+
+  const response = await api.get<ChatHistoryResponse>("/chat/history", {
+    headers: {
+      Authorization: `Bearer ${trimmedSessionId}`,
+    },
+    signal,
+    timeout: 10000,
+  });
+
+  return Array.isArray(response.data?.messages) ? response.data.messages : [];
+}
+
+export async function clearChatHistory(sessionId: string): Promise<void> {
+  const trimmedSessionId = sessionId?.trim();
+  if (!trimmedSessionId) {
+    throw new Error("Um sessionId válido é obrigatório.");
+  }
+
+  await api.delete("/chat/history", {
+    headers: {
+      Authorization: `Bearer ${trimmedSessionId}`,
+    },
+    timeout: 10000,
+  });
 }
 

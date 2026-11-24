@@ -245,25 +245,38 @@ export function BookDetailsModal({
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
       <DialogContent
-        className="w-[880px] max-w-[95vw] overflow-hidden p-0 border border-[#272A34] bg-[#14161B] text-[#F4F4F6] shadow-[0_24px_64px_rgba(0,0,0,0.7)]"
+        className="w-[920px] max-w-[95vw] overflow-hidden p-0 border border-[#272A34] bg-[#14161B] text-[#F4F4F6] shadow-[0_24px_64px_rgba(0,0,0,0.7)]"
       >
         <div
           ref={modalBodyRef}
           data-testid="book-details-scroll-container"
           className="flex flex-col md:flex-row max-h-[90vh] overflow-y-auto md:overflow-hidden"
         >
-          {/* Cover Side (Left, 300px) */}
-          <div className="relative w-full md:w-[300px] h-[320px] md:h-auto md:min-h-[520px] shrink-0 bg-[#14161B] border-b md:border-b-0 md:border-r border-[#272A34] overflow-hidden flex flex-col justify-between">
+          {/* Cover Side (Left, 340px) */}
+          <div className="relative w-full md:w-[340px] h-[340px] md:h-auto md:min-h-[520px] shrink-0 bg-[#0D0E12] border-b md:border-b-0 md:border-r border-[#272A34] overflow-hidden flex items-center justify-center">
             {hasImage ? (
-              <img
-                src={validCoverUrl!}
-                alt={`Capa do livro ${displayTitle}`}
-                loading="lazy"
-                decoding="async"
-                referrerPolicy="no-referrer"
-                onError={() => setImgError(true)}
-                className="h-full w-full object-cover"
-              />
+              <>
+                <img
+                  src={validCoverUrl!}
+                  alt=""
+                  aria-hidden="true"
+                  loading="lazy"
+                  decoding="async"
+                  referrerPolicy="no-referrer"
+                  className="pointer-events-none absolute inset-0 h-full w-full scale-110 object-cover opacity-25 blur-2xl"
+                />
+                <div className="relative z-10 flex h-full w-full items-center justify-center p-5 pt-12 md:p-6 md:pt-14">
+                  <img
+                    src={validCoverUrl!}
+                    alt={`Capa do livro ${displayTitle}`}
+                    loading="lazy"
+                    decoding="async"
+                    referrerPolicy="no-referrer"
+                    onError={() => setImgError(true)}
+                    className="max-h-full max-w-full rounded-md object-contain shadow-[0_16px_40px_rgba(0,0,0,0.65)] ring-1 ring-white/10"
+                  />
+                </div>
+              </>
             ) : (
               /* Fallback Cover */
               <div className="flex h-full w-full flex-col justify-between bg-gradient-to-br from-[#1F2432] via-[#14161B] to-[#0D0E12] p-6 text-center">
@@ -281,7 +294,7 @@ export function BookDetailsModal({
             )}
 
             {/* Top Badges Overlay on Cover */}
-            <div className="pointer-events-none absolute inset-x-0 top-0 flex items-center justify-between gap-1 p-3 pr-12 md:pr-3">
+            <div className="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-center justify-between gap-1 p-3 pr-12 md:pr-3">
               {primaryGenre ? (
                 <span className="rounded-[6px] bg-white/90 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-neutral-900 shadow-sm backdrop-blur-xs">
                   {primaryGenre.toUpperCase()}
